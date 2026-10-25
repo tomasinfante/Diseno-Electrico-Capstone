@@ -24,6 +24,7 @@ from collections import deque
 import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, request
+from picamera2 import Picamera2
 
 # ---------------- Parámetros ----------------
 ANCHO, ALTO = 640, 480
@@ -32,17 +33,18 @@ JPEG_CALIDAD = 70
 PUERTO = 5000
 
 # Modo del sensor (raw) a forzar. None = lo elige libcamera, que para 640x480
-# puede usar un modo recortado y reducir el campo de visión.
-# (1640, 1232) = campo de visión completo con binning 2x2.
-MODO_SENSOR = None
+# puede usar el modo nativo 640x480 (recorte central de 1280x960, FOV ~26.5°).
+# (1640, 1232) = campo de visión completo con binning 2x2 (hasta 81 FPS).
+MODO_SENSOR = (1640, 1232)
 
 # Camera Module 2 (IMX219), sensor completo: campo de visión horizontal y vertical [°]
 FOV_H, FOV_V = 62.2, 48.8
 
-ROJO_BAJO_1 = np.array([0, 120, 70])
-ROJO_ALTO_1 = np.array([10, 255, 255])
-ROJO_BAJO_2 = np.array([170, 120, 70])
-ROJO_ALTO_2 = np.array([179, 255, 255])
+VERDE_BAJO = np.array([40, 80, 120])
+VERDE_ALTO = np.array([90, 255, 255])
+# El centro del punto láser suele saturar el sensor y verse casi blanco
+NUCLEO_BAJO = np.array([0, 0, 230])
+NUCLEO_ALTO = np.array([179, 80, 255])
 
 AREA_MIN = 70           # px^2, descarta ruido
 CIRCULARIDAD_MIN = 0.6  # 1.0 = círculo perfecto
@@ -119,46 +121,20 @@ class CamaraPi:
         }
 
 
-class CamaraWebcam:
-    """Webcam vía OpenCV, para probar la interfaz en un PC sin picamera2."""
-
-    def __init__(self, indice=0):
-        self.cap = cv2.VideoCapture(indice)
-        if not self.cap.isOpened():
-            raise RuntimeError("No se encontró ninguna cámara")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, ANCHO)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ALTO)
-        self.cap.set(cv2.CAP_PROP_FPS, FPS_CAMARA)
-        self.info = {"fuente": "Webcam (OpenCV)", "sensor": None,
-                     "modo_sensor": None, "fov_supuesto": True}
-
-    def leer(self):
-        ok, frame = self.cap.read()
-        if not ok:
-            raise RuntimeError("No se pudo leer la webcam")
-        return frame, {"fps_nominal": self.cap.get(cv2.CAP_PROP_FPS) or None,
-                       "recorte": None, "fov": (FOV_H, FOV_V)}
-
-
-def abrir_camara():
-    try:
-        import picamera2  # noqa: F401
-    except ImportError:
-        print("picamera2 no disponible: usando webcam")
-        return CamaraWebcam()
-    return CamaraPi()
 
 
 # ---------------- Visión ----------------
 def detectar(frame_bgr):
-    """Devuelve (x, y, radio) de la mejor pelota roja, o None."""
+    """Devuelve (x, y, radio) del mejor punto de láser verde, o None."""
     blur = cv2.GaussianBlur(frame_bgr, (7, 7), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
-    mascara = cv2.inRange(hsv, ROJO_BAJO_1, ROJO_ALTO_1) | \
-              cv2.inRange(hsv, ROJO_BAJO_2, ROJO_ALTO_2)
-
     kernel = np.ones((5, 5), np.uint8)
+    verde = cv2.inRange(hsv, VERDE_BAJO, VERDE_ALTO)
+    # Núcleo blanco saturado: solo se acepta si está rodeado de verde
+    nucleo = cv2.inRange(hsv, NUCLEO_BAJO, NUCLEO_ALTO) & cv2.dilate(verde, kernel, iterations=2)
+    mascara = verde | nucleo
+
     mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel, iterations=1)
     mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
 
@@ -220,8 +196,8 @@ def dibujar(frame, objetivo, error, fps):
         largo = max(np.hypot(x - cx, y - cy), 1)
         cv2.arrowedLine(frame, (cx, cy), (x, y), (0, 220, 255), g, cv2.LINE_AA,
                         tipLength=min(0.3, 12 * g / largo))
-        cv2.circle(frame, (x, y), r, (0, 255, 0), 2 * g, cv2.LINE_AA)
-        cv2.circle(frame, (x, y), 3 * g, (0, 255, 0), -1)
+        cv2.circle(frame, (x, y), r, (255, 0, 255), 2 * g, cv2.LINE_AA)
+        cv2.circle(frame, (x, y), 3 * g, (255, 0, 255), -1)
 
         texto = f"({error[0]:+.0f}, {error[1]:+.0f}) px"
         tw = cv2.getTextSize(texto, FUENTE, 0.5 * g, g)[0][0] + 6 * g
@@ -234,7 +210,7 @@ def dibujar(frame, objetivo, error, fps):
 def bucle_camara():
     global ultimo_jpg, id_frame, estado
 
-    camara = abrir_camara()
+    camara = CamaraPi()
     t0 = time.time()
     llegadas = deque()  # instantes de llegada del último segundo
 
@@ -370,7 +346,7 @@ h1{font-size:18px;font-weight:600;margin:0 auto 0 0}
     <section class="card">
       <h2>Video en tiempo real <span class="num" id="tag-res">—</span></h2>
       <img id="video" src="/video" alt="Video de la cámara con el objetivo detectado">
-      <p class="nota">Cruz = centro de la imagen · círculo verde = objetivo · flecha = error de posición</p>
+      <p class="nota">Cruz = centro de la imagen · círculo magenta = objetivo · flecha = error de posición</p>
     </section>
     <section class="card">
       <h2>Error de posición vs tiempo <span>últimos 10 s</span></h2>
