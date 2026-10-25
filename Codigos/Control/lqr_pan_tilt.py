@@ -29,7 +29,9 @@ from scipy.signal import cont2discrete
 # ---------------- Parámetros ----------------
 TS = 1 / 30            # período de control = período de la cámara [s]
 ANCHO, ALTO = 640, 480
-# Camera Module 2: FOV 62.2° x 48.8°  ->  focal en píxeles
+# Camera Module 2, modo del sensor 1640x1232 (sensor completo) escalado a 640x480:
+# FOV 62.2° x 48.8°  ->  focal en píxeles (~530). Con el modo nativo 640x480
+# (recorte) la focal sería ~1357 px.
 F_X = (ANCHO / 2) / np.tan(np.radians(62.2 / 2))
 F_Y = (ALTO / 2) / np.tan(np.radians(48.8 / 2))
 
