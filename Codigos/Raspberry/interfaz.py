@@ -12,14 +12,6 @@ Instalación (Raspberry Pi OS Bookworm):
 
 UART (envía 0xAA 0x55 + ex, ey como int16 little-endian [px] por cada frame con objetivo):
     sudo raspi-config -> Interface Options -> Serial Port
-        ¿Login shell por serie? No · ¿Habilitar el hardware serie? Sí
-    Reiniciar. Conectar TX (GPIO14) -> RX del dispositivo, y GND común (3.3 V).
-
-Uso:
-    python3 interfaz.py
-    Abrir en el navegador: http://<ip-de-la-raspberry>:5000
-
-Si picamera2 no está instalado (p. ej. en un PC), usa la primera webcam vía OpenCV.
 """
 
 import struct
