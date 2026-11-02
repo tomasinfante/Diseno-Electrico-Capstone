@@ -8,7 +8,12 @@ Dashboard web con:
     4. FPS del video
 
 Instalación (Raspberry Pi OS Bookworm):
-    sudo apt install -y python3-picamera2 python3-opencv python3-flask
+    sudo apt install -y python3-picamera2 python3-opencv python3-flask python3-serial
+
+UART (envía 0xAA 0x55 + ex, ey como int16 little-endian [px] por cada frame con objetivo):
+    sudo raspi-config -> Interface Options -> Serial Port
+        ¿Login shell por serie? No · ¿Habilitar el hardware serie? Sí
+    Reiniciar. Conectar TX (GPIO14) -> RX del dispositivo, y GND común (3.3 V).
 
 Uso:
     python3 interfaz.py
@@ -17,39 +22,48 @@ Uso:
 Si picamera2 no está instalado (p. ej. en un PC), usa la primera webcam vía OpenCV.
 """
 
+import struct
 import threading
 import time
 from collections import deque
 
 import cv2
 import numpy as np
+import serial
 from flask import Flask, Response, jsonify, request
-from picamera2 import Picamera2
 
 # ---------------- Parámetros ----------------
 ANCHO, ALTO = 640, 480
-FPS_CAMARA = 30
-JPEG_CALIDAD = 70
+FPS_CAMARA = 50
+JPEG_CALIDAD = 40
 PUERTO = 5000
 
-# Modo del sensor (raw) a forzar. None = lo elige libcamera, que para 640x480
-# puede usar el modo nativo 640x480 (recorte central de 1280x960, FOV ~26.5°).
+
 # (1640, 1232) = campo de visión completo con binning 2x2 (hasta 81 FPS).
 MODO_SENSOR = (1640, 1232)
 
-# Camera Module 2 (IMX219), sensor completo: campo de visión horizontal y vertical [°]
+#FOV
 FOV_H, FOV_V = 62.2, 48.8
 
-VERDE_BAJO = np.array([40, 80, 120])
-VERDE_ALTO = np.array([90, 255, 255])
+# En OpenCV el tono (H) va de 0 a 179 y el rojo está en ambos extremos: se usan dos rangos
+ROJO1_BAJO = np.array([0, 100, 100])
+ROJO1_ALTO = np.array([10, 255, 255])
+ROJO2_BAJO = np.array([170, 100, 100])
+ROJO2_ALTO = np.array([179, 255, 255])
+
 # El centro del punto láser suele saturar el sensor y verse casi blanco
 NUCLEO_BAJO = np.array([0, 0, 230])
 NUCLEO_ALTO = np.array([179, 80, 255])
 
-AREA_MIN = 70           # px^2, descarta ruido
+AREA_MIN = 1           # px^2, descarta ruido
 CIRCULARIDAD_MIN = 0.6  # 1.0 = círculo perfecto
 
 HISTORIAL_MAX = 600     # muestras guardadas para los gráficos (~20 s a 30 FPS)
+
+# UART: GPIO14 (TX, pin 8), GPIO15 (RX, pin 10), GND (pin 6)
+UART_PUERTO = "/dev/serial0"
+UART_BAUDIOS = 115200
+UART_CABECERA = b"\xAA\x55"
 
 # ---------------- Estado compartido ----------------
 lock = threading.Lock()
@@ -125,15 +139,15 @@ class CamaraPi:
 
 # ---------------- Visión ----------------
 def detectar(frame_bgr):
-    """Devuelve (x, y, radio) del mejor punto de láser verde, o None."""
+    """Devuelve (x, y, radio) del mejor punto de láser rojo, o None."""
     blur = cv2.GaussianBlur(frame_bgr, (7, 7), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
     kernel = np.ones((5, 5), np.uint8)
-    verde = cv2.inRange(hsv, VERDE_BAJO, VERDE_ALTO)
-    # Núcleo blanco saturado: solo se acepta si está rodeado de verde
-    nucleo = cv2.inRange(hsv, NUCLEO_BAJO, NUCLEO_ALTO) & cv2.dilate(verde, kernel, iterations=2)
-    mascara = verde | nucleo
+    rojo = cv2.inRange(hsv, ROJO1_BAJO, ROJO1_ALTO) | cv2.inRange(hsv, ROJO2_BAJO, ROJO2_ALTO)
+    # Núcleo blanco saturado: solo se acepta si está rodeado de rojo
+    nucleo = cv2.inRange(hsv, NUCLEO_BAJO, NUCLEO_ALTO) & cv2.dilate(rojo, kernel, iterations=2)
+    mascara = rojo | nucleo
 
     mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel, iterations=1)
     mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -207,10 +221,35 @@ def dibujar(frame, objetivo, error, fps):
     etiqueta(frame, f"{ancho}x{alto}  {fps:.1f} FPS", 6, 6, 0.55 * g, g)
 
 
+# ---------------- UART ----------------
+def abrir_uart():
+    """Abre el puerto serie. Si falla, la interfaz sigue funcionando sin enviar."""
+    try:
+        return serial.Serial(UART_PUERTO, UART_BAUDIOS, timeout=0, write_timeout=0.01)
+    except serial.SerialException as e:
+        print(f"UART no disponible ({e}): no se enviarán los errores")
+        return None
+
+
+def enviar_uart(uart, ex, ey):
+    """
+    Envía la parte entera de ex y ey [px] en binario, en un paquete de 6 bytes:
+        0xAA 0x55 | ex (int16) | ey (int16)   — little-endian, con signo
+    La cabecera permite al receptor sincronizarse con el inicio de cada paquete.
+    """
+    if uart is None:
+        return
+    try:
+        uart.write(UART_CABECERA + struct.pack("<hh", int(ex), int(ey)))
+    except serial.SerialTimeoutException:
+        pass  # buffer lleno: se descarta esta muestra para no frenar el video
+
+
 def bucle_camara():
     global ultimo_jpg, id_frame, estado
 
     camara = CamaraPi()
+    uart = abrir_uart()
     t0 = time.time()
     llegadas = deque()  # instantes de llegada del último segundo
 
@@ -238,6 +277,9 @@ def bucle_camara():
         proc_ms = (time.perf_counter() - t_ini) * 1000
 
         ex, ey = (round(error[0], 1), round(error[1], 1)) if error else (None, None)
+        if error:
+            enviar_uart(uart, ex, ey)
+
         nuevo_estado = {
             **camara.info,
             "detectado": objetivo is not None,
