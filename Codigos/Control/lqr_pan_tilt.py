@@ -145,21 +145,6 @@ class ControladorEje:
         self.u = u_sat
         return u_sat
 
-
-# ---------------- Conversión píxeles -> error angular ----------------
-def errores_desde_pixeles(x_px, y_px, theta_tilt):
-    """
-    Convierte la detección (x, y) en píxeles a (e_pan, e_tilt) en rad.
-    Convención: pan positivo = girar a la izquierda, tilt positivo = arriba.
-    Si en tu montaje el motor gira al revés, invierte el signo correspondiente.
-    """
-    dx = x_px - ANCHO / 2          # + hacia la derecha
-    dy = y_px - ALTO / 2           # + hacia abajo (convención de imagen)
-    e_pan = -np.arctan(dx / F_X) / max(np.cos(theta_tilt), 0.2)
-    e_tilt = -np.arctan(dy / F_Y)
-    return e_pan, e_tilt
-
-
 # ---------------- Modelo exacto (convención OpenCV) ----------------
 # Base:   X adelante, Y izquierda, Z arriba
 # Cámara: x derecha,  y abajo,     z eje óptico  (igual que cv2.calibrateCamera)
@@ -237,34 +222,3 @@ def objetivo_tilt(t):
     return np.radians(10 * np.sin(0.4 * t + 0.5) + 4 * np.sin(1.3 * t))
 
 
-if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-
-    print(f"TS = {TS*1000:.1f} ms,  f_x = {F_X:.1f} px,  f_y = {F_Y:.1f} px\n")
-    fig, ax = plt.subplots(3, 2, figsize=(12, 8), sharex=True)
-    for col, (eje, obj) in enumerate([(PAN, objetivo_pan), (TILT, objetivo_tilt)]):
-        ctrl, log = simular(eje, obj)
-        print(f"[{eje.nombre}]  Klqr = {np.array2string(ctrl.Klqr.ravel(), precision=2)}"
-              f"   |polos| = {np.array2string(np.abs(ctrl.polos), precision=3)}")
-        err = np.degrees(log["theta_o"] - log["theta"])
-        vis = log["visible"].astype(bool)
-        print(f"         error RMS visible = {np.sqrt(np.mean(err[vis][30:]**2)):.3f}°"
-              f"   error máx en oclusión = {np.max(np.abs(err[~vis])):.2f}°")
-
-        t = log["t"]
-        ax[0, col].plot(t, np.degrees(log["theta_o"]), label="objetivo")
-        ax[0, col].plot(t, np.degrees(log["theta"]), label="plataforma")
-        ax[0, col].plot(t, np.degrees(log["theta_o_est"]), "--", label="objetivo (Kalman)")
-        ax[0, col].set_ylabel("ángulo [°]")
-        ax[0, col].set_title(eje.nombre)
-        ax[0, col].legend()
-        ax[1, col].plot(t, err)
-        ax[1, col].set_ylabel("error [°]")
-        ax[2, col].plot(t, log["u"])
-        ax[2, col].set_ylabel("u [V]")
-        ax[2, col].set_xlabel("t [s]")
-        for a in ax[:, col]:
-            a.axvspan(4, 5, color="gray", alpha=0.2)
-            a.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.show()
