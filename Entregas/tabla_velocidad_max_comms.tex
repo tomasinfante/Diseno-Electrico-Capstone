@@ -1,0 +1,17 @@
+% Velocidad angular máxima admisible por la comunicación (datos comms.txt)
+% omega_max = (FOV/2) / T: el objetivo, partiendo del centro de la imagen, no sale del
+% campo de visión entre dos datos. FOV de la Camera Module 2: 62,2° x 48,8°
+% T promedio = 21,56 ms (N = 580 muestras)
+\begin{table}[htbp]
+    \centering
+    \caption{Velocidad angular máxima admisible por la comunicación, $\omega_{max} = (\mathrm{FOV}/2)/T$, con $T = 21{,}56$ ms.}
+    \label{tab:velocidad_max_comms}
+    \begin{tabular}{ccc}
+        \hline
+        \textbf{Eje} & \textbf{FOV/2 [rad]} & \textbf{$\omega_{max}$ [rad/s]} \\
+        \hline
+        Pan  & 0,543 & 25,18 \\
+        Tilt & 0,426 & 19,75 \\
+        \hline
+    \end{tabular}
+\end{table}
