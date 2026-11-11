@@ -10,6 +10,19 @@ void controlPiIniciar(ControlPi *c, const ConfigControlPi *config)
     c->tPerdido = 0.0f;
 }
 
+void controlPiAjustar(ControlPi *c, float Kp, float Ki, float omegaMax)
+{
+    c->config.Kp = Kp;
+    c->config.Ki = Ki;
+    c->config.omegaMax = omegaMax;
+}
+
+void controlPiReiniciar(ControlPi *c)
+{
+    c->xi = 0.0f;
+    c->tPerdido = 0.0f;
+}
+
 float controlPiPaso(ControlPi *c, float e, bool visible)
 {
     const ConfigControlPi *p = &c->config;

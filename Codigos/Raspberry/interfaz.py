@@ -17,10 +17,13 @@ Etapas (la lógica de control la hace la ESP; aquí solo se le informa la etapa)
     2. Calibrar      > se eligen con los botones de la página
     3. Búsqueda     /
     4. Seguimiento  -> automática: desde Búsqueda, al detectar el objetivo por primera vez
+El objetivo a seguir (la figura triangular o el círculo de un láser rojo) y los parámetros
+de detección solo se pueden cambiar en la etapa Calibrar.
 
 Instalación de la UART:
     sudo raspi-config -> Interface Options -> Serial Port
-Paquete de 6 bytes: 0xAA | etapa (0x01..0x04) | ex (int16) | ey (int16), little-endian, en [px].
+Paquete de error, 6 bytes: 0xAA | etapa (0x01..0x04) | ex (int16) | ey (int16), little-endian, en [px].
+Paquete de parámetros del control, 13 bytes: 0xAA | 0x10 | 5 valores uint16 en milésimas | suma.
 """
 
 import json
@@ -64,7 +67,24 @@ RELLENO_MIN = 0.40      # área del contorno / área del triángulo que lo encie
 
 AREA_MIN = 150          # px^2; con menos píxeles la forma no es confiable
 
-# AREA_MIN y PROPORCION_TOL se pueden cambiar desde la página web; los valores
+# Objetivo alternativo: el círculo que produce un láser rojo.
+# El centro del punto suele saturar el sensor y verse casi blanco
+NUCLEO_BAJO = np.array([0, 0, 230])
+NUCLEO_ALTO = np.array([179, 80, 255])
+AREA_MIN_LASER = 1       # px^2, descarta ruido
+CIRCULARIDAD_MIN = 0.6   # 1.0 = círculo perfecto
+
+# Qué se sigue: "triangulo" (la figura triangular) o "laser" (el círculo del láser)
+OBJETIVOS = ("triangulo", "laser")
+OBJETIVO = "triangulo"
+
+# Parámetros del control que corre en la ESP: se le envían por la UART
+OMEGA_MAX = 3.0            # velocidad máxima de los ejes [rad/s]
+KP_PAN, KI_PAN = 2.0, 0.5  # ganancias del PI de cada eje: Kp [1/s], Ki [1/s²]
+KP_TILT, KI_TILT = 2.0, 0.5
+
+# Todo lo anterior (OBJETIVO, los parámetros de detección y los del control) se cambia desde
+# la página web: OMEGA_MAX en cualquier etapa y el resto solo en la etapa Calibrar. Los valores
 # guardados ahí quedan en este archivo y reemplazan a los de arriba al iniciar.
 ARCHIVO_AJUSTES = Path(__file__).with_name("ajustes.json")
 
@@ -73,7 +93,9 @@ HISTORIAL_MAX = 600     # muestras guardadas para los gráficos (~20 s a 30 FPS)
 # UART: GPIO14 (TX, pin 8), GPIO15 (RX, pin 10), GND (pin 6)
 UART_PUERTO = "/dev/serial0"
 UART_BAUDIOS = 115200
-UART_CABECERA = 0xAA    # primer byte; el segundo es la etapa
+UART_CABECERA = 0xAA    # primer byte; el segundo es la etapa o UART_TIPO_PARAMETROS
+UART_TIPO_PARAMETROS = 0x10
+PERIODO_PARAMETROS = 1.0  # s; los parámetros del control se reenvían por si la ESP se reinicia
 
 # Etapas del programa: su número es el segundo byte de la cabecera UART
 DETENIDO, CALIBRAR, BUSQUEDA, SEGUIMIENTO = 1, 2, 3, 4
@@ -82,6 +104,7 @@ ETAPAS_MANUALES = (DETENIDO, CALIBRAR, BUSQUEDA)  # las que se eligen con los bo
 
 # ---------------- Estado compartido ----------------
 etapa = DETENIDO  # se lee y se cambia siempre con `lock` tomado
+parametros_cambiados = threading.Event()  # hay que enviar ya los parámetros del control a la ESP
 lock = threading.Lock()
 nuevo_frame = threading.Condition(lock)
 ultimo_jpg = None
@@ -156,19 +179,67 @@ class CamaraPi:
 # ---------------- Visión ----------------
 def detectar(frame_bgr):
     """
+    Busca el objetivo elegido en la etapa Calibrar (OBJETIVO): el triángulo rojo o el
+    círculo del láser rojo. Devuelve un dict con al menos "tipo", "x" e "y" [px], o None
+    si no lo encuentra.
+    """
+    blur = cv2.GaussianBlur(frame_bgr, (7, 7), 0)
+    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+    rojo = cv2.inRange(hsv, ROJO1_BAJO, ROJO1_ALTO) | cv2.inRange(hsv, ROJO2_BAJO, ROJO2_ALTO)
+
+    if OBJETIVO == "laser":
+        return detectar_laser(hsv, rojo)
+    return detectar_triangulo(rojo)
+
+
+def contornos_de(mascara):
+    """Limpia la máscara (quita motas y cierra huecos) y devuelve sus contornos externos."""
+    kernel = np.ones((5, 5), np.uint8)
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel, iterations=1)
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+
+
+def detectar_laser(hsv, rojo):
+    """
+    Busca el punto del láser rojo: la mancha roja más grande que sea aproximadamente circular.
+    Devuelve un dict con el centro (x, y), el radio [px] y la circularidad medida; o None.
+    """
+    # Núcleo blanco saturado: solo se acepta si está rodeado de rojo
+    kernel = np.ones((5, 5), np.uint8)
+    nucleo = cv2.inRange(hsv, NUCLEO_BAJO, NUCLEO_ALTO) & cv2.dilate(rojo, kernel, iterations=2)
+
+    mejor, mejor_area = None, 0
+    for c in contornos_de(rojo | nucleo):
+        area = cv2.contourArea(c)
+        if area < AREA_MIN_LASER or area <= mejor_area:
+            continue
+        perimetro = cv2.arcLength(c, True)
+        if perimetro == 0:
+            continue
+        circularidad = 4 * np.pi * area / (perimetro ** 2)
+        if circularidad < CIRCULARIDAD_MIN:
+            continue
+
+        (x, y), radio = cv2.minEnclosingCircle(c)
+        mejor, mejor_area = {
+            "tipo": "laser",
+            "x": float(x),
+            "y": float(y),
+            "radio": float(radio),
+            "circularidad": float(circularidad),
+        }, area
+
+    return mejor
+
+
+def detectar_triangulo(rojo):
+    """
     Busca el objetivo rojo con forma de triángulo (base/altura ≈ PROPORCION).
     Devuelve un dict con el centroide (x, y), el triángulo [3 vértices], el vértice
     de la punta, base y altura [px] y la proporción medida; o None si no lo encuentra.
     """
-    blur = cv2.GaussianBlur(frame_bgr, (7, 7), 0)
-    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-
-    kernel = np.ones((5, 5), np.uint8)
-    mascara = cv2.inRange(hsv, ROJO1_BAJO, ROJO1_ALTO) | cv2.inRange(hsv, ROJO2_BAJO, ROJO2_ALTO)
-    mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel, iterations=1)
-    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    contornos, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contornos = contornos_de(rojo)
 
     mejor, mejor_area = None, 0
     for c in contornos:
@@ -196,6 +267,7 @@ def detectar(frame_bgr):
 
         mom = cv2.moments(c)
         mejor, mejor_area = {
+            "tipo": "triangulo",
             "x": mom["m10"] / mom["m00"],
             "y": mom["m01"] / mom["m00"],
             "tri": tri,
@@ -246,14 +318,19 @@ def dibujar(frame, objetivo, error, fps):
         largo = max(np.hypot(x - cx, y - cy), 1)
         cv2.arrowedLine(frame, (cx, cy), (x, y), (0, 220, 255), g, cv2.LINE_AA,
                         tipLength=min(0.3, 12 * g / largo))
-        tri = np.round(objetivo["tri"]).astype(np.int32)
-        cv2.polylines(frame, [tri], True, (255, 0, 255), 2 * g, cv2.LINE_AA)
-        px, py = (int(round(v)) for v in objetivo["punta"])
-        cv2.circle(frame, (px, py), 4 * g, (255, 255, 0), -1)  # punta del triángulo
+        if objetivo["tipo"] == "laser":
+            r = int(round(objetivo["radio"]))
+            cv2.circle(frame, (x, y), r, (255, 0, 255), 2 * g, cv2.LINE_AA)
+            x_min, x_max = x - r, x + r
+        else:
+            tri = np.round(objetivo["tri"]).astype(np.int32)
+            cv2.polylines(frame, [tri], True, (255, 0, 255), 2 * g, cv2.LINE_AA)
+            px, py = (int(round(v)) for v in objetivo["punta"])
+            cv2.circle(frame, (px, py), 4 * g, (255, 255, 0), -1)  # punta del triángulo
+            x_min, x_max = int(tri[:, 0].min()), int(tri[:, 0].max())
         cv2.circle(frame, (x, y), 3 * g, (255, 0, 255), -1)
 
-        # El texto va a la derecha del triángulo, o a la izquierda si no cabe
-        x_min, x_max = int(tri[:, 0].min()), int(tri[:, 0].max())
+        # El texto va a la derecha del objetivo, o a la izquierda si no cabe
         texto = f"({error[0]:+.0f}, {error[1]:+.0f}) px"
         tw = cv2.getTextSize(texto, FUENTE, 0.5 * g, g)[0][0] + 6 * g
         tx = x_max + 6 if x_max + 6 + tw < ancho else x_min - 6 - tw
@@ -279,12 +356,28 @@ def enviar_uart(uart, etapa, ex, ey):
     El 0xAA permite al receptor sincronizarse con el inicio de cada paquete y el
     segundo byte de la cabecera le indica la etapa del programa.
     """
+    escribir_uart(uart, struct.pack("<BBhh", UART_CABECERA, etapa, int(ex), int(ey)))
+
+
+def paquete_parametros():
+    """
+    Paquete de 13 bytes con los parámetros del control:
+        0xAA | 0x10 | omegaMax | KpPan | KiPan | KpTilt | KiTilt | suma
+    Cada valor es un uint16 little-endian en milésimas (2500 = 2.5). `suma` es la suma, módulo
+    256, de los 11 bytes anteriores (desde el 0x10): la ESP descarta el paquete si no coincide.
+    """
+    valores = [round(v * 1000) for v in (OMEGA_MAX, KP_PAN, KI_PAN, KP_TILT, KI_TILT)]
+    cuerpo = struct.pack("<B5H", UART_TIPO_PARAMETROS, *valores)
+    return bytes([UART_CABECERA]) + cuerpo + bytes([sum(cuerpo) & 0xFF])
+
+
+def escribir_uart(uart, datos):
     if uart is None:
         return
     try:
-        uart.write(struct.pack("<BBhh", UART_CABECERA, etapa, int(ex), int(ey)))
+        uart.write(datos)
     except serial.SerialTimeoutException:
-        pass  # buffer lleno: se descarta esta muestra para no frenar el video
+        pass  # buffer lleno: se descarta este paquete para no frenar el video
 
 
 def bucle_camara():
@@ -293,6 +386,7 @@ def bucle_camara():
     camara = CamaraPi()
     uart = abrir_uart()
     t0 = time.time()
+    t_parametros = 0.0  # último envío de los parámetros del control
     llegadas = deque()  # instantes de llegada del último segundo
 
     while True:
@@ -318,14 +412,14 @@ def bucle_camara():
                 print("Objetivo detectado: Búsqueda -> Seguimiento")
             etapa_frame = etapa
 
-        dibujar(frame, objetivo, error, fps)
-
-        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_CALIDAD])
-        if not ok:
-            continue
-        proc_ms = (time.perf_counter() - t_ini) * 1000
-
+        # La UART va antes de dibujar y codificar el JPEG, para no atrasar el control de la ESP
         ex, ey = (round(error[0], 1), round(error[1], 1)) if error else (None, None)
+        # Parámetros del control: apenas cambian en la página y además cada PERIODO_PARAMETROS
+        if parametros_cambiados.is_set() or t - t_parametros >= PERIODO_PARAMETROS:
+            parametros_cambiados.clear()
+            t_parametros = t
+            escribir_uart(uart, paquete_parametros())
+
         if etapa_frame != SEGUIMIENTO:
             # Detenido, Calibrar y Búsqueda: se informa la etapa en cada frame, con error 0
             enviar_uart(uart, etapa_frame, 0, 0)
@@ -333,15 +427,23 @@ def bucle_camara():
             # Seguimiento: solo con objetivo a la vista (la ESP detecta su pérdida por timeout)
             enviar_uart(uart, etapa_frame, ex, ey)
 
+        dibujar(frame, objetivo, error, fps)
+
+        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_CALIDAD])
+        if not ok:
+            continue
+        proc_ms = (time.perf_counter() - t_ini) * 1000
+
         nuevo_estado = {
             **camara.info,
             "etapa": etapa_frame,
             "detectado": objetivo is not None,
             "x": round(objetivo["x"], 1) if objetivo else None,
             "y": round(objetivo["y"], 1) if objetivo else None,
-            "base": round(objetivo["base"], 1) if objetivo else None,
-            "altura": round(objetivo["altura"], 1) if objetivo else None,
-            "proporcion": round(objetivo["proporcion"], 2) if objetivo else None,
+            "objetivo": OBJETIVO,
+            # Según el tipo de objetivo: base, altura y proporción (triángulo) o radio y circularidad (láser)
+            **{k: round(objetivo[k], n) if objetivo and k in objetivo else None
+               for k, n in (("base", 1), ("altura", 1), ("proporcion", 2), ("radio", 1), ("circularidad", 2))},
             "ex": ex,
             "ey": ey,
             "ex_deg": round(error[2], 2) if error else None,
@@ -443,7 +545,14 @@ h1{font-size:18px;font-weight:600;margin:0 auto 0 0}
 button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid var(--border);
        background:var(--surface);color:var(--text);cursor:pointer}
 button.principal{background:var(--s1);border-color:var(--s1);color:#fff}
+fieldset{border:0;padding:0;margin:0;min-width:0;display:flex;flex-direction:column;gap:16px}
+fieldset:disabled{opacity:.55}
+fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
+.opciones{display:flex;flex-wrap:wrap;gap:8px}
+.opciones button.activa{background:var(--s1);border-color:var(--s1);color:#fff;font-weight:600}
 #etapas{margin-bottom:16px}
+#control{margin-top:16px}
+#control fieldset{margin-top:16px}
 .etapas{display:flex;flex-wrap:wrap;gap:8px}
 .etapas button{padding:8px 18px}
 .etapas button:disabled{cursor:default;opacity:.55}
@@ -471,7 +580,7 @@ button.principal{background:var(--s1);border-color:var(--s1);color:#fff}
     <section class="card">
       <h2>Video en tiempo real <span class="num" id="tag-res">—</span></h2>
       <img id="video" src="/video" alt="Video de la cámara con el objetivo detectado">
-      <p class="nota">Cruz = centro de la imagen · círculo magenta = objetivo · flecha = error de posición</p>
+      <p class="nota">Cruz = centro de la imagen · contorno magenta = objetivo · flecha = error de posición</p>
     </section>
     <section class="card">
       <h2>Error de posición vs tiempo <span>últimos 10 s</span></h2>
@@ -521,20 +630,58 @@ button.principal{background:var(--s1);border-color:var(--s1);color:#fff}
   </div>
 </div>
 
-<section class="card" id="ajustes">
-  <h2>Parámetros de detección <span>se aplican al instante y quedan guardados</span></h2>
-  <form id="form-ajustes" class="campos">
-    <label class="campo"><span>Área mínima (AREA_MIN) [px²]</span>
-      <input type="number" id="area-min" min="1" step="1" required>
-      <small>Manchas rojas más pequeñas se descartan</small></label>
-    <label class="campo"><span>Tolerancia de proporción (PROPORCION_TOL)</span>
-      <input type="number" id="prop-tol" min="0.01" max="1" step="0.01" required>
-      <small id="rango-prop">—</small></label>
-    <div class="botones">
-      <button type="submit" class="principal">Guardar</button>
-      <button type="button" id="restablecer">Valores por defecto</button>
-    </div>
+<section class="card" id="control">
+  <h2>Control de los motores <span>se envían a la ESP al guardarlos</span></h2>
+  <form id="form-omega" class="campos">
+    <label class="campo"><span>Velocidad máxima (OMEGA_MAX) [rad/s]</span>
+      <input type="number" id="omega-max" min="0.1" max="10" step="0.05" required>
+      <small id="omega-grados">—</small></label>
+    <div class="botones"><button type="submit" class="principal">Aplicar</button></div>
   </form>
+  <p class="nota">La velocidad máxima se puede cambiar en cualquier etapa; las ganancias, solo en la etapa Calibrar.</p>
+  <fieldset class="solo-calibrar" disabled>
+    <form id="form-ganancias" class="campos">
+      <label class="campo"><span>Pan · Kp [1/s]</span>
+        <input type="number" id="kp-pan" min="0" max="50" step="0.01" required></label>
+      <label class="campo"><span>Pan · Ki [1/s²]</span>
+        <input type="number" id="ki-pan" min="0" max="50" step="0.01" required></label>
+      <label class="campo"><span>Tilt · Kp [1/s]</span>
+        <input type="number" id="kp-tilt" min="0" max="50" step="0.01" required></label>
+      <label class="campo"><span>Tilt · Ki [1/s²]</span>
+        <input type="number" id="ki-tilt" min="0" max="50" step="0.01" required></label>
+      <div class="botones"><button type="submit" class="principal">Guardar ganancias</button></div>
+    </form>
+  </fieldset>
+  <p class="nota" id="control-msg"></p>
+</section>
+
+<section class="card" id="ajustes">
+  <h2>Calibración <span id="ajustes-estado">solo se puede modificar en la etapa Calibrar</span></h2>
+  <fieldset class="solo-calibrar" disabled>
+    <div class="campo"><span>Objetivo a seguir</span>
+      <div class="opciones" id="objetivos">
+        <button type="button" data-objetivo="triangulo">Figura triangular</button>
+        <button type="button" data-objetivo="laser">Círculo del láser</button>
+      </div></div>
+    <form id="form-ajustes" class="campos">
+      <label class="campo"><span>Triángulo · área mínima (AREA_MIN) [px²]</span>
+        <input type="number" id="area-min" min="1" step="1" required>
+        <small>Manchas rojas más pequeñas se descartan</small></label>
+      <label class="campo"><span>Triángulo · tolerancia de proporción (PROPORCION_TOL)</span>
+        <input type="number" id="prop-tol" min="0.01" max="1" step="0.01" required>
+        <small id="rango-prop">—</small></label>
+      <label class="campo"><span>Láser · área mínima (AREA_MIN_LASER) [px²]</span>
+        <input type="number" id="area-min-laser" min="1" step="1" required>
+        <small>Manchas rojas más pequeñas se descartan</small></label>
+      <label class="campo"><span>Láser · circularidad mínima (CIRCULARIDAD_MIN)</span>
+        <input type="number" id="circ-min" min="0.01" max="1" step="0.01" required>
+        <small>1 = círculo perfecto</small></label>
+      <div class="botones">
+        <button type="submit" class="principal">Guardar</button>
+        <button type="button" id="restablecer">Valores por defecto</button>
+      </div>
+    </form>
+  </fieldset>
   <p class="nota" id="ajustes-msg"></p>
 </section>
 
@@ -761,6 +908,11 @@ function dibujarMira() {
 function pintarEtapa(n) {
   for (const b of document.querySelectorAll('#etapas button'))
     b.classList.toggle('activa', Number(b.dataset.etapa) === n);
+  const calibrando = n === 2;
+  for (const f of document.querySelectorAll('fieldset.solo-calibrar')) f.disabled = !calibrando;
+  $('ajustes-estado').textContent = calibrando
+    ? 'los cambios se aplican al instante y quedan guardados'
+    : 'solo se puede modificar en la etapa Calibrar';
 }
 
 async function cambiarEtapa(n) {
@@ -793,7 +945,9 @@ function pintarEstado(d) {
   $('em').textContent = det ? d.e_mag.toFixed(1) + ' px' : '—';
   $('ex-deg').textContent = det ? firmado(d.ex_deg, 2) + '°' : '—';
   $('ey-deg').textContent = det ? firmado(d.ey_deg, 2) + '°' : '—';
-  $('pos').textContent = det ? `(${d.x.toFixed(0)}, ${d.y.toFixed(0)}) b/h=${d.proporcion.toFixed(2)}` : '—';
+  const forma = d.proporcion != null ? ` b/h=${d.proporcion.toFixed(2)}`
+              : d.radio != null ? ` r=${d.radio.toFixed(0)} px` : '';
+  $('pos').textContent = det ? `(${d.x.toFixed(0)}, ${d.y.toFixed(0)})${forma}` : '—';
 
   $('fps').textContent = d.fps.toFixed(1);
   $('fps-nom').textContent = d.fps_nominal ? d.fps_nominal.toFixed(1) : '—';
@@ -861,15 +1015,30 @@ function mostrarRango() {
     `±${(tol * 100).toFixed(0)} % · acepta b/h entre ${(p * (1 - tol)).toFixed(2)} y ${(p * (1 + tol)).toFixed(2)}`;
 }
 
+function mostrarOmegaGrados() {
+  const w = parseFloat($('omega-max').value);
+  $('omega-grados').textContent = w > 0 ? `= ${(w * 180 / Math.PI).toFixed(0)} °/s` : '—';
+}
+
 function mostrarAjustes(a) {
   ajustes = a;
   $('area-min').value = a.area_min;
   $('prop-tol').value = a.proporcion_tol;
+  $('area-min-laser').value = a.area_min_laser;
+  $('circ-min').value = a.circularidad_min;
+  $('omega-max').value = a.omega_max;
+  $('kp-pan').value = a.kp_pan;
+  $('ki-pan').value = a.ki_pan;
+  $('kp-tilt').value = a.kp_tilt;
+  $('ki-tilt').value = a.ki_tilt;
+  mostrarOmegaGrados();
+  for (const b of document.querySelectorAll('#objetivos button'))
+    b.classList.toggle('activa', b.dataset.objetivo === a.objetivo);
   mostrarRango();
 }
 
-async function enviarAjustes(valores) {
-  const msg = $('ajustes-msg');
+async function enviarAjustes(valores, idMsg = 'ajustes-msg') {
+  const msg = $(idMsg);
   try {
     const r = await fetch('/ajustes', {method: 'POST', headers: {'Content-Type': 'application/json'},
                                         body: JSON.stringify(valores)});
@@ -885,7 +1054,20 @@ async function enviarAjustes(valores) {
 $('prop-tol').addEventListener('input', mostrarRango);
 $('form-ajustes').addEventListener('submit', e => {
   e.preventDefault();
-  enviarAjustes({area_min: Number($('area-min').value), proporcion_tol: Number($('prop-tol').value)});
+  enviarAjustes({area_min: Number($('area-min').value), proporcion_tol: Number($('prop-tol').value),
+                 area_min_laser: Number($('area-min-laser').value), circularidad_min: Number($('circ-min').value)});
+});
+for (const b of document.querySelectorAll('#objetivos button'))
+  b.addEventListener('click', () => enviarAjustes({objetivo: b.dataset.objetivo}));
+$('omega-max').addEventListener('input', mostrarOmegaGrados);
+$('form-omega').addEventListener('submit', e => {
+  e.preventDefault();
+  enviarAjustes({omega_max: Number($('omega-max').value)}, 'control-msg');
+});
+$('form-ganancias').addEventListener('submit', e => {
+  e.preventDefault();
+  enviarAjustes({kp_pan: Number($('kp-pan').value), ki_pan: Number($('ki-pan').value),
+                 kp_tilt: Number($('kp-tilt').value), ki_tilt: Number($('ki-tilt').value)}, 'control-msg');
 });
 $('restablecer').addEventListener('click', () => { if (ajustes) enviarAjustes(ajustes.defecto); });
 fetch('/ajustes').then(r => r.json()).then(mostrarAjustes).catch(() => {});
@@ -945,29 +1127,62 @@ def ruta_etapa():
 
 
 # ---------------- Ajustes editables desde la página ----------------
-AJUSTES_DEFECTO = {"area_min": AREA_MIN, "proporcion_tol": PROPORCION_TOL}
+# Ajustes numéricos: clave -> (mínimo, máximo, decimales)
+AJUSTES_NUMERICOS = {
+    "area_min": (1, ANCHO * ALTO, 0),
+    "proporcion_tol": (0.01, 1, 3),
+    "area_min_laser": (1, ANCHO * ALTO, 0),
+    "circularidad_min": (0.01, 1, 3),
+    "omega_max": (0.1, 10, 3),
+    "kp_pan": (0, 50, 3),
+    "ki_pan": (0, 50, 3),
+    "kp_tilt": (0, 50, 3),
+    "ki_tilt": (0, 50, 3),
+}
+AJUSTES_CONTROL = ("omega_max", "kp_pan", "ki_pan", "kp_tilt", "ki_tilt")  # los que se envían a la ESP
+AJUSTES_LIBRES = ("omega_max",)  # se pueden cambiar en cualquier etapa; el resto solo en Calibrar
+
+
+def ajustes_actuales():
+    return {"objetivo": OBJETIVO, "area_min": AREA_MIN, "proporcion_tol": PROPORCION_TOL,
+            "area_min_laser": AREA_MIN_LASER, "circularidad_min": CIRCULARIDAD_MIN,
+            "omega_max": OMEGA_MAX, "kp_pan": KP_PAN, "ki_pan": KI_PAN,
+            "kp_tilt": KP_TILT, "ki_tilt": KI_TILT}
+
+
+AJUSTES_DEFECTO = ajustes_actuales()
 
 
 def validar_ajustes(datos):
-    """Devuelve (area_min, proporcion_tol) validados; lanza ValueError si no son válidos."""
-    try:
-        area_min = float(datos["area_min"])
-        tol = float(datos["proporcion_tol"])
-    except (KeyError, TypeError, ValueError):
-        raise ValueError("faltan area_min o proporcion_tol, o no son números")
-    if not 1 <= area_min <= ANCHO * ALTO:
-        raise ValueError(f"area_min debe estar entre 1 y {ANCHO * ALTO} px²")
-    if not 0.01 <= tol <= 1:
-        raise ValueError("proporcion_tol debe estar entre 0.01 y 1")
-    return round(area_min), round(tol, 3)
+    """
+    Completa `datos` con los valores actuales (se puede enviar solo lo que cambia) y
+    devuelve el dict de ajustes validado; lanza ValueError si algo no es válido.
+    """
+    a = {**ajustes_actuales(), **{k: v for k, v in datos.items() if k in AJUSTES_DEFECTO}}
+
+    if a["objetivo"] not in OBJETIVOS:
+        raise ValueError('objetivo debe ser "triangulo" o "laser"')
+    for k, (minimo, maximo, decimales) in AJUSTES_NUMERICOS.items():
+        try:
+            a[k] = float(a[k])
+        except (TypeError, ValueError):
+            raise ValueError(f"{k} no es un número")
+        if not minimo <= a[k] <= maximo:
+            raise ValueError(f"{k} debe estar entre {minimo} y {maximo}")
+        a[k] = round(a[k], decimales) if decimales else round(a[k])
+    return a
 
 
 def aplicar_ajustes(datos, guardar):
-    global AREA_MIN, PROPORCION_TOL
-    AREA_MIN, PROPORCION_TOL = validar_ajustes(datos)
+    global OBJETIVO, AREA_MIN, PROPORCION_TOL, AREA_MIN_LASER, CIRCULARIDAD_MIN
+    global OMEGA_MAX, KP_PAN, KI_PAN, KP_TILT, KI_TILT
+    a = validar_ajustes(datos)
+    OBJETIVO, AREA_MIN, PROPORCION_TOL = a["objetivo"], a["area_min"], a["proporcion_tol"]
+    AREA_MIN_LASER, CIRCULARIDAD_MIN = a["area_min_laser"], a["circularidad_min"]
+    OMEGA_MAX, KP_PAN, KI_PAN, KP_TILT, KI_TILT = (a[k] for k in AJUSTES_CONTROL)
+    parametros_cambiados.set()  # el bucle de la cámara los envía a la ESP en el próximo frame
     if guardar:
-        ARCHIVO_AJUSTES.write_text(json.dumps(
-            {"area_min": AREA_MIN, "proporcion_tol": PROPORCION_TOL}, indent=2))
+        ARCHIVO_AJUSTES.write_text(json.dumps(a, indent=2))
 
 
 def cargar_ajustes():
@@ -976,23 +1191,33 @@ def cargar_ajustes():
         return
     try:
         aplicar_ajustes(json.loads(ARCHIVO_AJUSTES.read_text()), guardar=False)
-        print(f"Ajustes cargados de {ARCHIVO_AJUSTES.name}: "
-              f"AREA_MIN={AREA_MIN}, PROPORCION_TOL={PROPORCION_TOL}")
-    except (OSError, ValueError) as e:
+        print(f"Ajustes cargados de {ARCHIVO_AJUSTES.name}: {ajustes_actuales()}")
+    except (OSError, ValueError, AttributeError) as e:
         print(f"No se pudo leer {ARCHIVO_AJUSTES.name} ({e}): se usan los valores del código")
 
 
 @app.route("/ajustes", methods=["GET", "POST"])
 def ajustes():
+    """
+    GET: ajustes actuales. POST: cambia los que se envíen. La velocidad máxima (omega_max)
+    se puede cambiar en cualquier etapa; todos los demás, solo durante la etapa Calibrar.
+    """
     if request.method == "POST":
+        datos = request.get_json(silent=True)
+        if not isinstance(datos, dict) or not any(k in AJUSTES_DEFECTO for k in datos):
+            return jsonify(error="no se recibió ningún ajuste"), 400
+        solo_calibrar = [k for k in datos if k in AJUSTES_DEFECTO and k not in AJUSTES_LIBRES]
         try:
-            aplicar_ajustes(request.get_json(silent=True) or {}, guardar=True)
+            # Con `lock` tomado la etapa no puede cambiar entre la revisión y el cambio
+            with lock:
+                if solo_calibrar and etapa != CALIBRAR:
+                    return jsonify(error="fuera de la etapa Calibrar solo se puede cambiar la velocidad máxima"), 409
+                aplicar_ajustes(datos, guardar=True)
         except ValueError as e:
             return jsonify(error=str(e)), 400
         except OSError as e:
             return jsonify(error=f"se aplicó, pero no se pudo guardar ({e})"), 500
-    return jsonify(area_min=AREA_MIN, proporcion_tol=PROPORCION_TOL,
-                   proporcion=round(PROPORCION, 4), defecto=AJUSTES_DEFECTO)
+    return jsonify(**ajustes_actuales(), proporcion=round(PROPORCION, 4), defecto=AJUSTES_DEFECTO)
 
 
 if __name__ == "__main__":

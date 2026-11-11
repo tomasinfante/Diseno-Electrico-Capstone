@@ -32,5 +32,11 @@ typedef struct {
 
 void controlPiIniciar(ControlPi *c, const ConfigControlPi *config);
 
+// Cambia las ganancias y la saturación con el control andando
+void controlPiAjustar(ControlPi *c, float Kp, float Ki, float omegaMax);
+
+// Olvida la integral del error. Para cuando el PI deja de usarse (otra etapa del programa).
+void controlPiReiniciar(ControlPi *c);
+
 // Un paso del PI. Devuelve la velocidad [rad/s] que debe tener el eje hasta el próximo paso.
 float controlPiPaso(ControlPi *c, float e, bool visible);

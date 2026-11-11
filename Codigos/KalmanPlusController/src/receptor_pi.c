@@ -4,11 +4,13 @@
 #include "esp_timer.h"
 #include "freertos/task.h"
 
-#define CABECERA_1 0xAA  // el segundo byte de la cabecera es la etapa
+#define CABECERA_1 0xAA      // el segundo byte de la cabecera es la etapa o TIPO_PARAMETROS
+#define TIPO_PARAMETROS 0x10
+#define LARGO_PARAMETROS 11  // 5 valores uint16 + suma de comprobación
 #define TAMANO_BUFFER_RX 1024
 #define TAMANO_COLA_EVENTOS 20
 
-enum { ESPERA_CAB1, ESPERA_CAB2, LEYENDO_DATOS };
+enum { ESPERA_CAB1, ESPERA_CAB2, LEYENDO_DATOS, LEYENDO_PARAMETROS };
 
 static const char *TAG = "receptor_pi";
 
@@ -17,7 +19,40 @@ static int16_t leerInt16LE(const uint8_t *p)
     return (int16_t)(p[0] | (p[1] << 8));
 }
 
-// Máquina de estados: procesa un byte y devuelve true al completar un paquete válido
+static void contarDescartado(ReceptorPi *r)
+{
+    taskENTER_CRITICAL(&r->mux);
+    r->paquetesDescartados++;
+    taskEXIT_CRITICAL(&r->mux);
+}
+
+// Revisa la suma de comprobación del paquete de parámetros en r->datos y, si está bien, los guarda
+static void guardarParametros(ReceptorPi *r)
+{
+    uint8_t suma = TIPO_PARAMETROS;
+    for (int i = 0; i < LARGO_PARAMETROS - 1; i++) {
+        suma += r->datos[i];
+    }
+    if (suma != r->datos[LARGO_PARAMETROS - 1]) {
+        contarDescartado(r);
+        return;
+    }
+
+    ParametrosControl p = {
+        .omegaMax = (uint16_t)leerInt16LE(&r->datos[0]) / 1000.0f,
+        .kpPan = (uint16_t)leerInt16LE(&r->datos[2]) / 1000.0f,
+        .kiPan = (uint16_t)leerInt16LE(&r->datos[4]) / 1000.0f,
+        .kpTilt = (uint16_t)leerInt16LE(&r->datos[6]) / 1000.0f,
+        .kiTilt = (uint16_t)leerInt16LE(&r->datos[8]) / 1000.0f,
+    };
+
+    taskENTER_CRITICAL(&r->mux);
+    r->parametros = p;
+    r->hayParametros = true;
+    taskEXIT_CRITICAL(&r->mux);
+}
+
+// Máquina de estados: procesa un byte y devuelve true al completar un paquete de error válido
 static bool procesarByte(ReceptorPi *r, uint8_t b, ErrorObjetivo *salida)
 {
     switch (r->estadoRx) {
@@ -32,6 +67,9 @@ static bool procesarByte(ReceptorPi *r, uint8_t b, ErrorObjetivo *salida)
             if (b >= ETAPA_DETENIDO && b <= ETAPA_SEGUIMIENTO) {
                 r->etapaRx = b;
                 r->estadoRx = LEYENDO_DATOS;
+                r->nDatos = 0;
+            } else if (b == TIPO_PARAMETROS) {
+                r->estadoRx = LEYENDO_PARAMETROS;
                 r->nDatos = 0;
             } else if (b != CABECERA_1) {  // con 0xAA 0xAA etapa el segundo 0xAA puede ser la cabecera real
                 r->estadoRx = ESPERA_CAB1;
@@ -52,9 +90,7 @@ static bool procesarByte(ReceptorPi *r, uint8_t b, ErrorObjetivo *salida)
 
             // No hay checksum: un error fuera de la imagen indica un paquete corrupto o desalineado
             if (ex < -maxEx || ex > maxEx || ey < -maxEy || ey > maxEy) {
-                taskENTER_CRITICAL(&r->mux);
-                r->paquetesDescartados++;
-                taskEXIT_CRITICAL(&r->mux);
+                contarDescartado(r);
                 return false;
             }
 
@@ -64,6 +100,14 @@ static bool procesarByte(ReceptorPi *r, uint8_t b, ErrorObjetivo *salida)
             salida->etapa = (EtapaPrograma)r->etapaRx;
             return true;
         }
+
+        case LEYENDO_PARAMETROS:
+            r->datos[r->nDatos++] = b;
+            if (r->nDatos == LARGO_PARAMETROS) {
+                r->estadoRx = ESPERA_CAB1;
+                guardarParametros(r);
+            }
+            return false;
     }
 
     return false;
@@ -131,6 +175,7 @@ void receptorPiIniciar(ReceptorPi *r, const ConfigReceptorPi *config)
     r->estadoRx = ESPERA_CAB1;
     r->nDatos = 0;
     r->hayDatos = false;
+    r->hayParametros = false;
     r->paquetesOk = 0;
     r->paquetesDescartados = 0;
 
@@ -171,6 +216,18 @@ EtapaPrograma receptorPiEtapa(ReceptorPi *r)
     taskEXIT_CRITICAL(&r->mux);
 
     return etapa;
+}
+
+bool receptorPiParametros(ReceptorPi *r, ParametrosControl *salida)
+{
+    taskENTER_CRITICAL(&r->mux);
+    bool hay = r->hayParametros;
+    if (hay) {
+        *salida = r->parametros;
+    }
+    taskEXIT_CRITICAL(&r->mux);
+
+    return hay;
 }
 
 void receptorPiEstadisticas(ReceptorPi *r, uint32_t *ok, uint32_t *descartados)
