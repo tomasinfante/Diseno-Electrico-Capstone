@@ -10,14 +10,25 @@ Dashboard web con:
 Instalación (Raspberry Pi OS Bookworm):
     sudo apt install -y python3-picamera2 python3-opencv python3-flask python3-serial
 
-UART (envía 0xAA 0x55 + ex, ey como int16 little-endian [px] por cada frame con objetivo):
+    5. Botones para cambiar la etapa del programa (Detenido, Calibrar, Búsqueda)
+
+Etapas (la lógica de control la hace la ESP; aquí solo se le informa la etapa):
+    1. Detenido     \
+    2. Calibrar      > se eligen con los botones de la página
+    3. Búsqueda     /
+    4. Seguimiento  -> automática: desde Búsqueda, al detectar el objetivo por primera vez
+
+Instalación de la UART:
     sudo raspi-config -> Interface Options -> Serial Port
+Paquete de 6 bytes: 0xAA | etapa (0x01..0x04) | ex (int16) | ey (int16), little-endian, en [px].
 """
 
+import json
 import struct
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -43,21 +54,34 @@ ROJO1_ALTO = np.array([10, 255, 255])
 ROJO2_BAJO = np.array([170, 100, 100])
 ROJO2_ALTO = np.array([179, 255, 255])
 
-# El centro del punto láser suele saturar el sensor y verse casi blanco
-NUCLEO_BAJO = np.array([0, 0, 230])
-NUCLEO_ALTO = np.array([179, 80, 255])
+# Objetivo aproximado como triángulo isósceles: base 81.66 mm, altura 100 mm
+TRI_BASE_MM = 81.66
+TRI_ALTURA_MM = 100.0
+PROPORCION = TRI_BASE_MM / TRI_ALTURA_MM  # base/altura esperada (≈ 0.82)
+PROPORCION_TOL = 0.20   # desviación relativa aceptada en base/altura (±20 %)
+ISOSCELES_TOL = 0.25    # diferencia relativa aceptada entre los dos lados largos
+RELLENO_MIN = 0.40      # área del contorno / área del triángulo que lo encierra
 
-AREA_MIN = 1           # px^2, descarta ruido
-CIRCULARIDAD_MIN = 0.6  # 1.0 = círculo perfecto
+AREA_MIN = 150          # px^2; con menos píxeles la forma no es confiable
+
+# AREA_MIN y PROPORCION_TOL se pueden cambiar desde la página web; los valores
+# guardados ahí quedan en este archivo y reemplazan a los de arriba al iniciar.
+ARCHIVO_AJUSTES = Path(__file__).with_name("ajustes.json")
 
 HISTORIAL_MAX = 600     # muestras guardadas para los gráficos (~20 s a 30 FPS)
 
 # UART: GPIO14 (TX, pin 8), GPIO15 (RX, pin 10), GND (pin 6)
 UART_PUERTO = "/dev/serial0"
 UART_BAUDIOS = 115200
-UART_CABECERA = b"\xAA\x55"
+UART_CABECERA = 0xAA    # primer byte; el segundo es la etapa
+
+# Etapas del programa: su número es el segundo byte de la cabecera UART
+DETENIDO, CALIBRAR, BUSQUEDA, SEGUIMIENTO = 1, 2, 3, 4
+ETAPAS = {DETENIDO: "Detenido", CALIBRAR: "Calibrar", BUSQUEDA: "Búsqueda", SEGUIMIENTO: "Seguimiento"}
+ETAPAS_MANUALES = (DETENIDO, CALIBRAR, BUSQUEDA)  # las que se eligen con los botones
 
 # ---------------- Estado compartido ----------------
+etapa = DETENIDO  # se lee y se cambia siempre con `lock` tomado
 lock = threading.Lock()
 nuevo_frame = threading.Condition(lock)
 ultimo_jpg = None
@@ -131,16 +155,16 @@ class CamaraPi:
 
 # ---------------- Visión ----------------
 def detectar(frame_bgr):
-    """Devuelve (x, y, radio) del mejor punto de láser rojo, o None."""
+    """
+    Busca el objetivo rojo con forma de triángulo (base/altura ≈ PROPORCION).
+    Devuelve un dict con el centroide (x, y), el triángulo [3 vértices], el vértice
+    de la punta, base y altura [px] y la proporción medida; o None si no lo encuentra.
+    """
     blur = cv2.GaussianBlur(frame_bgr, (7, 7), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
     kernel = np.ones((5, 5), np.uint8)
-    rojo = cv2.inRange(hsv, ROJO1_BAJO, ROJO1_ALTO) | cv2.inRange(hsv, ROJO2_BAJO, ROJO2_ALTO)
-    # Núcleo blanco saturado: solo se acepta si está rodeado de rojo
-    nucleo = cv2.inRange(hsv, NUCLEO_BAJO, NUCLEO_ALTO) & cv2.dilate(rojo, kernel, iterations=2)
-    mascara = rojo | nucleo
-
+    mascara = cv2.inRange(hsv, ROJO1_BAJO, ROJO1_ALTO) | cv2.inRange(hsv, ROJO2_BAJO, ROJO2_ALTO)
     mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel, iterations=1)
     mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
 
@@ -149,17 +173,37 @@ def detectar(frame_bgr):
     mejor, mejor_area = None, 0
     for c in contornos:
         area = cv2.contourArea(c)
-        if area < AREA_MIN:
+        if area < AREA_MIN or area <= mejor_area:
             continue
-        perimetro = cv2.arcLength(c, True)
-        if perimetro == 0:
+
+        area_tri, tri = cv2.minEnclosingTriangle(cv2.convexHull(c))
+        if area_tri <= 0 or area / area_tri < RELLENO_MIN:
             continue
-        circularidad = 4 * np.pi * area / (perimetro ** 2)
-        if circularidad < CIRCULARIDAD_MIN:
+        tri = tri.reshape(3, 2)
+
+        # lados[i] = lado opuesto al vértice i. La base es el lado más corto
+        # (81.66 mm frente a ≈108 mm de los otros dos) y su vértice opuesto es la punta.
+        lados = [float(np.linalg.norm(tri[(i + 1) % 3] - tri[(i + 2) % 3])) for i in range(3)]
+        i_punta = int(np.argmin(lados))
+        base = lados[i_punta]
+        altura = 2 * area_tri / base
+        proporcion = base / altura
+        if abs(proporcion / PROPORCION - 1) > PROPORCION_TOL:
             continue
-        if area > mejor_area:
-            (x, y), r = cv2.minEnclosingCircle(c)
-            mejor, mejor_area = (float(x), float(y), float(r)), area
+        largo1, largo2 = (lados[j] for j in range(3) if j != i_punta)
+        if abs(largo1 - largo2) / max(largo1, largo2) > ISOSCELES_TOL:
+            continue
+
+        mom = cv2.moments(c)
+        mejor, mejor_area = {
+            "x": mom["m10"] / mom["m00"],
+            "y": mom["m01"] / mom["m00"],
+            "tri": tri,
+            "punta": tri[i_punta],
+            "base": base,
+            "altura": altura,
+            "proporcion": proporcion,
+        }, area
 
     return mejor
 
@@ -198,16 +242,21 @@ def dibujar(frame, objetivo, error, fps):
     cv2.drawMarker(frame, (cx, cy), (220, 220, 220), cv2.MARKER_CROSS, 24 * g, g)
 
     if objetivo:
-        x, y, r = (int(round(v)) for v in objetivo)
+        x, y = int(round(objetivo["x"])), int(round(objetivo["y"]))
         largo = max(np.hypot(x - cx, y - cy), 1)
         cv2.arrowedLine(frame, (cx, cy), (x, y), (0, 220, 255), g, cv2.LINE_AA,
                         tipLength=min(0.3, 12 * g / largo))
-        cv2.circle(frame, (x, y), r, (255, 0, 255), 2 * g, cv2.LINE_AA)
+        tri = np.round(objetivo["tri"]).astype(np.int32)
+        cv2.polylines(frame, [tri], True, (255, 0, 255), 2 * g, cv2.LINE_AA)
+        px, py = (int(round(v)) for v in objetivo["punta"])
+        cv2.circle(frame, (px, py), 4 * g, (255, 255, 0), -1)  # punta del triángulo
         cv2.circle(frame, (x, y), 3 * g, (255, 0, 255), -1)
 
+        # El texto va a la derecha del triángulo, o a la izquierda si no cabe
+        x_min, x_max = int(tri[:, 0].min()), int(tri[:, 0].max())
         texto = f"({error[0]:+.0f}, {error[1]:+.0f}) px"
         tw = cv2.getTextSize(texto, FUENTE, 0.5 * g, g)[0][0] + 6 * g
-        tx = x + r + 6 if x + r + 6 + tw < ancho else x - r - 6 - tw
+        tx = x_max + 6 if x_max + 6 + tw < ancho else x_min - 6 - tw
         etiqueta(frame, texto, tx, y - 10 * g, 0.5 * g, g)
 
     etiqueta(frame, f"{ancho}x{alto}  {fps:.1f} FPS", 6, 6, 0.55 * g, g)
@@ -223,22 +272,23 @@ def abrir_uart():
         return None
 
 
-def enviar_uart(uart, ex, ey):
+def enviar_uart(uart, etapa, ex, ey):
     """
-    Envía la parte entera de ex y ey [px] en binario, en un paquete de 6 bytes:
-        0xAA 0x55 | ex (int16) | ey (int16)   — little-endian, con signo
-    La cabecera permite al receptor sincronizarse con el inicio de cada paquete.
+    Envía la etapa y la parte entera de ex y ey [px] en binario, en un paquete de 6 bytes:
+        0xAA | etapa (0x01..0x04) | ex (int16) | ey (int16)   — little-endian, con signo
+    El 0xAA permite al receptor sincronizarse con el inicio de cada paquete y el
+    segundo byte de la cabecera le indica la etapa del programa.
     """
     if uart is None:
         return
     try:
-        uart.write(UART_CABECERA + struct.pack("<hh", int(ex), int(ey)))
+        uart.write(struct.pack("<BBhh", UART_CABECERA, etapa, int(ex), int(ey)))
     except serial.SerialTimeoutException:
         pass  # buffer lleno: se descarta esta muestra para no frenar el video
 
 
 def bucle_camara():
-    global ultimo_jpg, id_frame, estado
+    global ultimo_jpg, id_frame, estado, etapa
 
     camara = CamaraPi()
     uart = abrir_uart()
@@ -259,7 +309,14 @@ def bucle_camara():
         alto, ancho = frame.shape[:2]
 
         objetivo = detectar(frame)
-        error = calcular_error(objetivo[0], objetivo[1], ancho, alto, meta["fov"]) if objetivo else None
+        error = calcular_error(objetivo["x"], objetivo["y"], ancho, alto, meta["fov"]) if objetivo else None
+
+        # Búsqueda -> Seguimiento en el primer frame en que aparece el objetivo
+        with lock:
+            if etapa == BUSQUEDA and objetivo:
+                etapa = SEGUIMIENTO
+                print("Objetivo detectado: Búsqueda -> Seguimiento")
+            etapa_frame = etapa
 
         dibujar(frame, objetivo, error, fps)
 
@@ -269,15 +326,22 @@ def bucle_camara():
         proc_ms = (time.perf_counter() - t_ini) * 1000
 
         ex, ey = (round(error[0], 1), round(error[1], 1)) if error else (None, None)
-        if error:
-            enviar_uart(uart, ex, ey)
+        if etapa_frame != SEGUIMIENTO:
+            # Detenido, Calibrar y Búsqueda: se informa la etapa en cada frame, con error 0
+            enviar_uart(uart, etapa_frame, 0, 0)
+        elif error:
+            # Seguimiento: solo con objetivo a la vista (la ESP detecta su pérdida por timeout)
+            enviar_uart(uart, etapa_frame, ex, ey)
 
         nuevo_estado = {
             **camara.info,
+            "etapa": etapa_frame,
             "detectado": objetivo is not None,
-            "x": round(objetivo[0], 1) if objetivo else None,
-            "y": round(objetivo[1], 1) if objetivo else None,
-            "radio": round(objetivo[2], 1) if objetivo else None,
+            "x": round(objetivo["x"], 1) if objetivo else None,
+            "y": round(objetivo["y"], 1) if objetivo else None,
+            "base": round(objetivo["base"], 1) if objetivo else None,
+            "altura": round(objetivo["altura"], 1) if objetivo else None,
+            "proporcion": round(objetivo["proporcion"], 2) if objetivo else None,
             "ex": ex,
             "ey": ey,
             "ex_deg": round(error[2], 2) if error else None,
@@ -368,12 +432,39 @@ h1{font-size:18px;font-weight:600;margin:0 auto 0 0}
      border-radius:6px;padding:6px 8px;font-size:12px;white-space:nowrap;
      box-shadow:0 4px 12px rgba(0,0,0,.25);font-variant-numeric:tabular-nums}
 .tip .t{color:var(--muted);margin-bottom:2px}
+#ajustes{margin-top:16px}
+.campos{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end}
+.campo{display:flex;flex-direction:column;gap:4px;min-width:180px}
+.campo span{font-size:12px;color:var(--muted)}
+.campo input{font:inherit;font-variant-numeric:tabular-nums;color:var(--text);background:var(--bg);
+             border:1px solid var(--border);border-radius:6px;padding:6px 8px;width:100%}
+.campo small{font-size:12px;color:var(--text-2);font-variant-numeric:tabular-nums}
+.botones{display:flex;gap:8px}
+button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid var(--border);
+       background:var(--surface);color:var(--text);cursor:pointer}
+button.principal{background:var(--s1);border-color:var(--s1);color:#fff}
+#etapas{margin-bottom:16px}
+.etapas{display:flex;flex-wrap:wrap;gap:8px}
+.etapas button{padding:8px 18px}
+.etapas button:disabled{cursor:default;opacity:.55}
+.etapas button.activa{background:var(--s1);border-color:var(--s1);color:#fff;font-weight:600;opacity:1}
 </style></head><body>
 <header>
   <h1>Interfaz de seguimiento</h1>
   <span class="pill" id="estado"><span class="ico">…</span> Esperando datos</span>
   <span class="pill"><span class="dot" id="conn-dot"></span><span id="conn">Conectando</span></span>
 </header>
+
+<section class="card" id="etapas">
+  <h2>Etapa del programa <span>Seguimiento se activa sola al detectar el objetivo durante la búsqueda</span></h2>
+  <div class="etapas">
+    <button type="button" data-etapa="1">1 · Detenido</button>
+    <button type="button" data-etapa="2">2 · Calibrar</button>
+    <button type="button" data-etapa="3">3 · Búsqueda</button>
+    <button type="button" data-etapa="4" disabled title="Automática: no se elige a mano">4 · Seguimiento</button>
+  </div>
+  <p class="nota" id="etapa-msg"></p>
+</section>
 
 <div class="grid">
   <div class="col">
@@ -429,6 +520,23 @@ h1{font-size:18px;font-weight:600;margin:0 auto 0 0}
     </section>
   </div>
 </div>
+
+<section class="card" id="ajustes">
+  <h2>Parámetros de detección <span>se aplican al instante y quedan guardados</span></h2>
+  <form id="form-ajustes" class="campos">
+    <label class="campo"><span>Área mínima (AREA_MIN) [px²]</span>
+      <input type="number" id="area-min" min="1" step="1" required>
+      <small>Manchas rojas más pequeñas se descartan</small></label>
+    <label class="campo"><span>Tolerancia de proporción (PROPORCION_TOL)</span>
+      <input type="number" id="prop-tol" min="0.01" max="1" step="0.01" required>
+      <small id="rango-prop">—</small></label>
+    <div class="botones">
+      <button type="submit" class="principal">Guardar</button>
+      <button type="button" id="restablecer">Valores por defecto</button>
+    </div>
+  </form>
+  <p class="nota" id="ajustes-msg"></p>
+</section>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -650,7 +758,31 @@ function dibujarMira() {
 }
 
 // ---------- Paneles numéricos ----------
+function pintarEtapa(n) {
+  for (const b of document.querySelectorAll('#etapas button'))
+    b.classList.toggle('activa', Number(b.dataset.etapa) === n);
+}
+
+async function cambiarEtapa(n) {
+  const msg = $('etapa-msg');
+  try {
+    const r = await fetch('/etapa', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                      body: JSON.stringify({etapa: n})});
+    const d = await r.json();
+    if (!r.ok) { msg.textContent = 'Error: ' + d.error; return; }
+    pintarEtapa(d.etapa);
+    msg.textContent = '';
+  } catch (e) {
+    msg.textContent = 'No se pudo cambiar la etapa: sin conexión con la Raspberry';
+  }
+}
+
+for (const b of document.querySelectorAll('#etapas button:not(:disabled)'))
+  b.addEventListener('click', () => cambiarEtapa(Number(b.dataset.etapa)));
+fetch('/etapa').then(r => r.json()).then(d => pintarEtapa(d.etapa)).catch(() => {});
+
 function pintarEstado(d) {
+  pintarEtapa(d.etapa);
   const det = d.detectado;
   $('estado').innerHTML = det
     ? '<span class="ico ok">✓</span> Objetivo detectado'
@@ -661,7 +793,7 @@ function pintarEstado(d) {
   $('em').textContent = det ? d.e_mag.toFixed(1) + ' px' : '—';
   $('ex-deg').textContent = det ? firmado(d.ex_deg, 2) + '°' : '—';
   $('ey-deg').textContent = det ? firmado(d.ey_deg, 2) + '°' : '—';
-  $('pos').textContent = det ? `(${d.x.toFixed(0)}, ${d.y.toFixed(0)}) r=${d.radio.toFixed(0)}` : '—';
+  $('pos').textContent = det ? `(${d.x.toFixed(0)}, ${d.y.toFixed(0)}) b/h=${d.proporcion.toFixed(2)}` : '—';
 
   $('fps').textContent = d.fps.toFixed(1);
   $('fps-nom').textContent = d.fps_nominal ? d.fps_nominal.toFixed(1) : '—';
@@ -718,6 +850,46 @@ async function actualizar() {
   setTimeout(actualizar, 100);
 }
 
+// ---------- Parámetros de detección ----------
+let ajustes = null;
+
+function mostrarRango() {
+  const tol = parseFloat($('prop-tol').value);
+  if (!ajustes || !(tol > 0)) { $('rango-prop').textContent = '—'; return; }
+  const p = ajustes.proporcion;
+  $('rango-prop').textContent =
+    `±${(tol * 100).toFixed(0)} % · acepta b/h entre ${(p * (1 - tol)).toFixed(2)} y ${(p * (1 + tol)).toFixed(2)}`;
+}
+
+function mostrarAjustes(a) {
+  ajustes = a;
+  $('area-min').value = a.area_min;
+  $('prop-tol').value = a.proporcion_tol;
+  mostrarRango();
+}
+
+async function enviarAjustes(valores) {
+  const msg = $('ajustes-msg');
+  try {
+    const r = await fetch('/ajustes', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                        body: JSON.stringify(valores)});
+    const d = await r.json();
+    if (!r.ok) { msg.textContent = 'Error: ' + d.error; return; }
+    mostrarAjustes(d);
+    msg.textContent = `Guardado a las ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    msg.textContent = 'No se pudo guardar: sin conexión con la Raspberry';
+  }
+}
+
+$('prop-tol').addEventListener('input', mostrarRango);
+$('form-ajustes').addEventListener('submit', e => {
+  e.preventDefault();
+  enviarAjustes({area_min: Number($('area-min').value), proporcion_tol: Number($('prop-tol').value)});
+});
+$('restablecer').addEventListener('click', () => { if (ajustes) enviarAjustes(ajustes.defecto); });
+fetch('/ajustes').then(r => r.json()).then(mostrarAjustes).catch(() => {});
+
 new ResizeObserver(dibujarTodo).observe(document.body);
 matchMedia('(prefers-color-scheme: light)').addEventListener('change', dibujarTodo);
 actualizar();
@@ -755,6 +927,75 @@ def video():
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+# ---------------- Etapa del programa ----------------
+@app.route("/etapa", methods=["GET", "POST"])
+def ruta_etapa():
+    """GET: etapa actual. POST {"etapa": 1|2|3}: cambia a Detenido, Calibrar o Búsqueda."""
+    global etapa
+    if request.method == "POST":
+        nueva = (request.get_json(silent=True) or {}).get("etapa")
+        if type(nueva) is not int or nueva not in ETAPAS_MANUALES:
+            return jsonify(error="la etapa debe ser 1 (Detenido), 2 (Calibrar) o 3 (Búsqueda)"), 400
+        with lock:
+            anterior, etapa = etapa, nueva
+        if anterior != nueva:
+            print(f"Etapa: {ETAPAS[anterior]} -> {ETAPAS[nueva]}")
+    with lock:
+        return jsonify(etapa=etapa, nombre=ETAPAS[etapa])
+
+
+# ---------------- Ajustes editables desde la página ----------------
+AJUSTES_DEFECTO = {"area_min": AREA_MIN, "proporcion_tol": PROPORCION_TOL}
+
+
+def validar_ajustes(datos):
+    """Devuelve (area_min, proporcion_tol) validados; lanza ValueError si no son válidos."""
+    try:
+        area_min = float(datos["area_min"])
+        tol = float(datos["proporcion_tol"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("faltan area_min o proporcion_tol, o no son números")
+    if not 1 <= area_min <= ANCHO * ALTO:
+        raise ValueError(f"area_min debe estar entre 1 y {ANCHO * ALTO} px²")
+    if not 0.01 <= tol <= 1:
+        raise ValueError("proporcion_tol debe estar entre 0.01 y 1")
+    return round(area_min), round(tol, 3)
+
+
+def aplicar_ajustes(datos, guardar):
+    global AREA_MIN, PROPORCION_TOL
+    AREA_MIN, PROPORCION_TOL = validar_ajustes(datos)
+    if guardar:
+        ARCHIVO_AJUSTES.write_text(json.dumps(
+            {"area_min": AREA_MIN, "proporcion_tol": PROPORCION_TOL}, indent=2))
+
+
+def cargar_ajustes():
+    """Aplica los ajustes guardados desde la página, si existen."""
+    if not ARCHIVO_AJUSTES.exists():
+        return
+    try:
+        aplicar_ajustes(json.loads(ARCHIVO_AJUSTES.read_text()), guardar=False)
+        print(f"Ajustes cargados de {ARCHIVO_AJUSTES.name}: "
+              f"AREA_MIN={AREA_MIN}, PROPORCION_TOL={PROPORCION_TOL}")
+    except (OSError, ValueError) as e:
+        print(f"No se pudo leer {ARCHIVO_AJUSTES.name} ({e}): se usan los valores del código")
+
+
+@app.route("/ajustes", methods=["GET", "POST"])
+def ajustes():
+    if request.method == "POST":
+        try:
+            aplicar_ajustes(request.get_json(silent=True) or {}, guardar=True)
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        except OSError as e:
+            return jsonify(error=f"se aplicó, pero no se pudo guardar ({e})"), 500
+    return jsonify(area_min=AREA_MIN, proporcion_tol=PROPORCION_TOL,
+                   proporcion=round(PROPORCION, 4), defecto=AJUSTES_DEFECTO)
+
+
 if __name__ == "__main__":
+    cargar_ajustes()
     threading.Thread(target=bucle_camara, daemon=True).start()
     app.run(host="0.0.0.0", port=PUERTO, threaded=True)

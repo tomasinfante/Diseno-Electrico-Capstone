@@ -4,8 +4,7 @@
 #include "esp_timer.h"
 #include "freertos/task.h"
 
-#define CABECERA_1 0xAA
-#define CABECERA_2 0x55
+#define CABECERA_1 0xAA  // el segundo byte de la cabecera es la etapa
 #define TAMANO_BUFFER_RX 1024
 #define TAMANO_COLA_EVENTOS 20
 
@@ -30,10 +29,11 @@ static bool procesarByte(ReceptorPi *r, uint8_t b, ErrorObjetivo *salida)
             return false;
 
         case ESPERA_CAB2:
-            if (b == CABECERA_2) {
+            if (b >= ETAPA_DETENIDO && b <= ETAPA_SEGUIMIENTO) {
+                r->etapaRx = b;
                 r->estadoRx = LEYENDO_DATOS;
                 r->nDatos = 0;
-            } else if (b != CABECERA_1) {  // con 0xAA 0xAA 0x55 el segundo 0xAA puede ser la cabecera real
+            } else if (b != CABECERA_1) {  // con 0xAA 0xAA etapa el segundo 0xAA puede ser la cabecera real
                 r->estadoRx = ESPERA_CAB1;
             }
             return false;
@@ -61,6 +61,7 @@ static bool procesarByte(ReceptorPi *r, uint8_t b, ErrorObjetivo *salida)
             salida->ex = ex;
             salida->ey = ey;
             salida->t_us = esp_timer_get_time();
+            salida->etapa = (EtapaPrograma)r->etapaRx;
             return true;
         }
     }
@@ -158,7 +159,18 @@ bool receptorPiLeer(ReceptorPi *r, ErrorObjetivo *salida)
     bool valido = r->hayDatos;
     taskEXIT_CRITICAL(&r->mux);
 
-    return valido && (esp_timer_get_time() - salida->t_us) < r->config.timeoutUs;
+    // Fuera de Seguimiento los paquetes solo informan la etapa (ex = ey = 0): no hay objetivo
+    return valido && salida->etapa == ETAPA_SEGUIMIENTO &&
+           (esp_timer_get_time() - salida->t_us) < r->config.timeoutUs;
+}
+
+EtapaPrograma receptorPiEtapa(ReceptorPi *r)
+{
+    taskENTER_CRITICAL(&r->mux);
+    EtapaPrograma etapa = r->hayDatos ? r->ultimo.etapa : ETAPA_DETENIDO;
+    taskEXIT_CRITICAL(&r->mux);
+
+    return etapa;
 }
 
 void receptorPiEstadisticas(ReceptorPi *r, uint32_t *ok, uint32_t *descartados)

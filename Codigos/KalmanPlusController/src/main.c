@@ -4,15 +4,17 @@
  *
  * Módulos (cada uno con su header y sin depender de los demás):
  *     receptor_pi  recibe por UART el error ex, ey [px] que envía interfaz.py
- *     camara       convierte el error de píxeles a ángulo
+ *     camara       convierte el error en píxeles a la dirección del objetivo respecto del gimbal
  *     control_pi   PI de velocidad de un eje
  *     motor_pasos  genera los pasos de un motor con DRV8825
+ *     encoder_as5600  lee el ángulo del eje de un motor
  * Este archivo los configura, crea una instancia de cada uno y los conecta en la tarea de control.
  *
  * La UART0 (USB) queda para el monitor a 115200.
  */
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 
 #include "esp_timer.h"
@@ -21,6 +23,7 @@
 
 #include "camara.h"
 #include "control_pi.h"
+#include "encoder_as5600.h"
 #include "motor_pasos.h"
 #include "receptor_pi.h"
 
@@ -28,7 +31,8 @@
 #define ACTIVAR_CONTROL false  // false: solo recepción, los motores quedan sin habilitar
 #define TS (1.0f / 50.0f)      // período de control [s], a la par de la cámara (FPS_CAMARA = 50 en interfaz.py)
 #define PERIODO_IMPRESION_MS 100
-#define RAD_A_GRADOS (360.0f / 6.28318531f)
+#define DOS_PI 6.28318531f
+#define RAD_A_GRADOS (360.0f / DOS_PI)
 
 #define ANCHO_IMG 640  // deben coincidir con interfaz.py
 #define ALTO_IMG 480
@@ -67,6 +71,23 @@ static const ConfigMotorPasos CONFIG_MOTOR_TILT = {
     .signo = 1.0f,
 };
 
+// Un AS5600 por motor, cada uno en su bus I2C (pull-ups de 4.7 kΩ en la PCB)
+static const ConfigEncoderAs5600 CONFIG_ENCODER_PAN = {
+    .puerto = I2C_NUM_0,
+    .sda = GPIO_NUM_21,
+    .scl = GPIO_NUM_22,
+    .reduccion = 1.0f,  // la misma que la del motor del pan
+    .signo = 1.0f,
+};
+
+static const ConfigEncoderAs5600 CONFIG_ENCODER_TILT = {
+    .puerto = I2C_NUM_1,
+    .sda = GPIO_NUM_25,
+    .scl = GPIO_NUM_33,
+    .reduccion = 1.0f,  // la misma que la del motor del tilt
+    .signo = 1.0f,
+};
+
 // Ganancias iniciales: ajustarlas en la plataforma real
 static const ConfigControlPi CONFIG_CONTROL_PAN = {
     .Kp = 2.0f,
@@ -89,8 +110,35 @@ static ReceptorPi receptor;
 static Camara camara;
 static MotorPasos motorPan;
 static MotorPasos motorTilt;
+static EncoderAs5600 encoderPan;
+static EncoderAs5600 encoderTilt;
 static ControlPi controlPan;
 static ControlPi controlTilt;
+
+// ---------------- Ángulos ----------------
+// Ángulo actual de un eje de la plataforma [rad]: el que mide el encoder o, si el sensor
+// no está, el comandado por el control. El cero (α = β = 0) es la posición de arranque.
+static float anguloEje(EncoderAs5600 *enc, const ControlPi *control)
+{
+    float angulo;
+    if (encoderAs5600Leer(enc, &angulo)) {
+        return angulo;
+    }
+    return control->theta;
+}
+
+// Pan y tilt a los que está el objetivo respecto del gimbal y error de cada eje (objetivo - plataforma)
+static void errorObjetivo(const ErrorObjetivo *medicion, float *alfaObj, float *betaObj, float *ePan, float *eTilt)
+{
+    float alfa = anguloEje(&encoderPan, &controlPan);
+    float beta = anguloEje(&encoderTilt, &controlTilt);
+
+    camaraDireccionObjetivo(&camara, medicion->ex, medicion->ey, alfa, beta, alfaObj, betaObj);
+
+    // αobj está entre -π y π y el pan de la plataforma acumula vueltas: se toma el camino más corto
+    *ePan = remainderf(*alfaObj - alfa, DOS_PI);
+    *eTilt = *betaObj - beta;
+}
 
 // ---------------- Lazo de control ----------------
 static TaskHandle_t tareaControlHandle;
@@ -107,7 +155,8 @@ static void tareaControl(void *arg)
         float ePan = 0.0f;
         float eTilt = 0.0f;
         if (visible) {
-            camaraErrorAngular(&camara, medicion.ex, medicion.ey, &ePan, &eTilt);
+            float alfaObj, betaObj;
+            errorObjetivo(&medicion, &alfaObj, &betaObj, &ePan, &eTilt);
         }
 
         motorPasosFijarVelocidad(&motorPan, controlPiPaso(&controlPan, ePan, visible));
@@ -134,11 +183,25 @@ static void iniciarLazoControl(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(timer, (uint64_t)(TS * 1e6f)));
 }
 
+// ---------------- Monitor ----------------
+// Ángulo del encoder en grados, o "--" si el sensor no respondió al iniciar
+static void textoEncoder(EncoderAs5600 *enc, char *texto, size_t largo)
+{
+    float angulo;
+    if (encoderAs5600Leer(enc, &angulo)) {
+        snprintf(texto, largo, "%.1f°", angulo * RAD_A_GRADOS);
+    } else {
+        snprintf(texto, largo, "--");
+    }
+}
+
 // ---------------- Programa ----------------
 void app_main(void)
 {
     receptorPiIniciar(&receptor, &CONFIG_RECEPTOR);
     camaraIniciar(&camara, &CONFIG_CAMARA);
+    encoderAs5600Iniciar(&encoderPan, &CONFIG_ENCODER_PAN);
+    encoderAs5600Iniciar(&encoderTilt, &CONFIG_ENCODER_TILT);
 
     if (ACTIVAR_CONTROL) {
         motorPasosIniciar(&motorPan, &CONFIG_MOTOR_PAN);
@@ -167,12 +230,26 @@ void app_main(void)
         paquetesAntes = ok;
         tAntes = ahora;
 
+        static const char *const NOMBRES_ETAPA[] = {"?", "Detenido", "Calibrar", "Busqueda", "Seguimiento"};
+        printf("%s | ", NOMBRES_ETAPA[receptorPiEtapa(&receptor)]);
+
         if (visible) {
-            printf("ex: %d px | ey: %d px", e.ex, e.ey);
+            float alfaObj, betaObj, ePan, eTilt;
+            errorObjetivo(&e, &alfaObj, &betaObj, &ePan, &eTilt);
+            printf("ex: %d px | ey: %d px | objetivo: pan %.1f° tilt %.1f°", e.ex, e.ey,
+                   alfaObj * RAD_A_GRADOS, betaObj * RAD_A_GRADOS);
         } else {
             printf("Sin objetivo");
         }
         printf(" | %.1f Hz | descartados: %" PRIu32, tasa, descartados);
-        printf(" | pan: %.1f° tilt: %.1f°\n", controlPan.theta * RAD_A_GRADOS, controlTilt.theta * RAD_A_GRADOS);
+
+        // Ángulo comandado por el control y medido por el encoder: si se separan, el motor perdió pasos
+        char encPan[16], encTilt[16];
+        textoEncoder(&encoderPan, encPan, sizeof(encPan));
+        textoEncoder(&encoderTilt, encTilt, sizeof(encTilt));
+        uint32_t erroresI2c = encoderAs5600Errores(&encoderPan) + encoderAs5600Errores(&encoderTilt);
+
+        printf(" | pan: cmd %.1f° enc %s | tilt: cmd %.1f° enc %s | errores I2C: %" PRIu32 "\n",
+               controlPan.theta * RAD_A_GRADOS, encPan, controlTilt.theta * RAD_A_GRADOS, encTilt, erroresI2c);
     }
 }
