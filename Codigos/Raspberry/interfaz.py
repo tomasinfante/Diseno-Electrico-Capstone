@@ -42,6 +42,9 @@ from flask import Flask, Response, jsonify, request
 ANCHO, ALTO = 640, 480
 FPS_CAMARA = 50
 JPEG_CALIDAD = 40
+# El video del dashboard se dibuja y codifica en un hilo aparte, a lo más a este ritmo, para
+# que no le quite tiempo a la detección (que va al ritmo de la cámara).
+VIDEO_FPS_MAX = 25
 PUERTO = 5000
 
 
@@ -51,21 +54,47 @@ MODO_SENSOR = (1640, 1232)
 #FOV
 FOV_H, FOV_V = 62.2, 48.8
 
-# En OpenCV el tono (H) va de 0 a 179 y el rojo está en ambos extremos: se usan dos rangos
-ROJO1_BAJO = np.array([0, 100, 100])
-ROJO1_ALTO = np.array([10, 255, 255])
-ROJO2_BAJO = np.array([170, 100, 100])
-ROJO2_ALTO = np.array([179, 255, 255])
+# Color del objetivo. En OpenCV el tono (H) va de 0 a 179 y el rojo está en ambos extremos:
+# se acepta desde TONO_ROJO_MIN hasta 179 y desde 0 hasta TONO_MAX.
+# El tono es lo que separa al rojo de la piel: con esta cámara el rojo queda entre 175 y 2,
+# y la cara y las manos entre 8 y 18 con una saturación parecida a la del rojo. Por eso
+# TONO_MAX es bajo: si sube de ~7 empieza a entrar la piel.
+# El brillo mínimo es bajo a propósito: a contraluz el objetivo se ve oscuro, pero conserva
+# su tono y su saturación.
+TONO_ROJO_MIN = 168
+TONO_MAX = 5        # tono máximo que cuenta como rojo (0 a 15)
+# La saturación separa al avión de los labios, que tienen su mismo tono: en la cámara el avión
+# mide ~200 y los labios y la piel más rojiza no pasan de ~157.
+SAT_MIN = 160       # saturación mínima (0 a 255): descarta grises, blancos, labios y piel
+# En el borde del objetivo el color se mezcla con el fondo y la saturación baja. Para no
+# recortarlo (importa cuando se ve chico), una mancha puede incluir píxeles hasta SAT_BORDE
+# por debajo de SAT_MIN, siempre que al menos NUCLEO_FRAC de ella sí llegue a SAT_MIN.
+SAT_BORDE = 50
+NUCLEO_FRAC = 0.25
+BRILLO_MIN = 40     # brillo mínimo (0 a 255): descarta lo casi negro, donde el tono es puro ruido
+
+# Compensación de exposición de la cámara [EV]: positiva aclara la imagen. Sirve cuando el
+# objetivo está a contraluz y queda tan oscuro que ya no se distingue su color.
+EXPOSICION_EV = 0.0
+
+VER_MASCARA = False  # pinta en el video los píxeles que cuentan como rojo, para calibrar
 
 # Objetivo aproximado como triángulo isósceles: base 81.66 mm, altura 100 mm
 TRI_BASE_MM = 81.66
 TRI_ALTURA_MM = 100.0
 PROPORCION = TRI_BASE_MM / TRI_ALTURA_MM  # base/altura esperada (≈ 0.82)
-PROPORCION_TOL = 0.20   # desviación relativa aceptada en base/altura (±20 %)
+# ±25 %: con el avión real la proporción medida va de 0.77 a 1.0 según el tamaño y el giro
+PROPORCION_TOL = 0.25   # desviación relativa aceptada en base/altura
 ISOSCELES_TOL = 0.25    # diferencia relativa aceptada entre los dos lados largos
+# El objetivo es la silueta de un avión: tiene entrantes entre las alas y el fuselaje, así que
+# llena solo una parte del triángulo que la encierra. Por eso el relleno mínimo es bajo y no
+# se exige que la forma sea convexa. Subirlo descarta más formas, pero también al avión.
 RELLENO_MIN = 0.40      # área del contorno / área del triángulo que lo encierra
+# El avión ocupa cerca de la mitad del rectángulo que lo encierra (0.51 a 0.54 medido); un
+# óvalo (labios, una cara) ocupa 0.79 y un rectángulo 1.0
+OCUPACION_MAX = 0.70    # área del contorno / área del rectángulo que lo encierra
 
-AREA_MIN = 150          # px^2; con menos píxeles la forma no es confiable
+AREA_MIN = 80         # px^2; con menos píxeles la forma no es confiable
 
 # Objetivo alternativo: el círculo que produce un láser rojo.
 # El centro del punto suele saturar el sensor y verse casi blanco
@@ -73,6 +102,12 @@ NUCLEO_BAJO = np.array([0, 0, 230])
 NUCLEO_ALTO = np.array([179, 80, 255])
 AREA_MIN_LASER = 1       # px^2, descarta ruido
 CIRCULARIDAD_MIN = 0.6   # 1.0 = círculo perfecto
+
+# Continuidad entre cuadros: evita saltar a otra cosa y las detecciones de un solo cuadro
+FRAMES_CONFIRMAR = 3    # cuadros seguidos en que debe verse un objetivo nuevo antes de aceptarlo
+MEMORIA_S = 0.3         # s; si el objetivo desaparece, durante este tiempo no se acepta otro lejos de él
+PUERTA_BASE = 0.10      # distancia máxima entre cuadros, en anchos de imagen...
+PUERTA_POR_S = 3.0      # ...más lo que puede moverse por segundo, también en anchos de imagen
 
 # Qué se sigue: "triangulo" (la figura triangular) o "laser" (el círculo del láser)
 OBJETIVOS = ("triangulo", "laser")
@@ -106,9 +141,13 @@ ETAPAS_MANUALES = (DETENIDO, CALIBRAR, BUSQUEDA)  # las que se eligen con los bo
 etapa = DETENIDO  # se lee y se cambia siempre con `lock` tomado
 parametros_cambiados = threading.Event()  # hay que enviar ya los parámetros del control a la ESP
 lock = threading.Lock()
-nuevo_frame = threading.Condition(lock)
+nuevo_frame = threading.Condition(lock)   # hay un JPEG nuevo para el video
 ultimo_jpg = None
-id_frame = 0
+id_video = 0                               # cuenta los JPEG publicados
+id_frame = 0                               # cuenta los cuadros procesados (detección)
+info_video = {"jpg_kb": 0.0, "fps_video": 0.0, "video_ms": 0.0}
+hay_cuadro = threading.Condition()         # la detección dejó un cuadro para el hilo del video
+cuadro_video = None                        # (frame, objetivo, error, fps, mascara, descartes)
 estado = None
 historial = deque(maxlen=HISTORIAL_MAX)  # [id, t, detectado, ex, ey, fps]
 
@@ -153,6 +192,13 @@ class CamaraPi:
             "fov_supuesto": False,
         }
 
+    def fijar_ev(self, ev):
+        """Compensación de exposición [EV]: positiva aclara la imagen, negativa la oscurece."""
+        try:
+            self.picam2.set_controls({"ExposureValue": float(ev)})
+        except Exception as e:  # la cámara sigue funcionando con la exposición que tenía
+            print(f"No se pudo fijar la compensación de exposición ({e})")
+
     def leer(self):
         req = self.picam2.capture_request()
         try:
@@ -177,19 +223,55 @@ class CamaraPi:
 
 
 # ---------------- Visión ----------------
+def tono_rojo(hsv, sat_min):
+    return (cv2.inRange(hsv, (0, sat_min, BRILLO_MIN), (TONO_MAX, 255, 255))
+            | cv2.inRange(hsv, (TONO_ROJO_MIN, sat_min, BRILLO_MIN), (179, 255, 255)))
+
+
+def mascara_roja(hsv):
+    """
+    Píxeles que cuentan como rojo: tono cerca de 0, con saturación y brillo suficientes.
+    Se arma en dos niveles: el rojo "fuerte" (saturación >= SAT_MIN) decide qué manchas
+    valen, y cada una se completa con el rojo "débil" que la rodea (hasta SAT_BORDE menos).
+    Una mancha solo de rojo débil, como los labios, queda fuera.
+    """
+    debil = tono_rojo(hsv, max(SAT_MIN - SAT_BORDE, 0))
+
+    # El resto se hace solo en el rectángulo que contiene al rojo (suele ser una zona chica)
+    x, y, w, h = cv2.boundingRect(debil)
+    if w == 0:
+        return debil
+    zona = debil[y:y + h, x:x + w]
+    fuerte = (hsv[y:y + h, x:x + w, 1] >= SAT_MIN) & (zona > 0)
+
+    n, etiquetas = cv2.connectedComponents(zona)
+    total = np.bincount(etiquetas.ravel(), minlength=n)
+    nucleo = np.bincount(etiquetas[fuerte], minlength=n)
+    vale = nucleo >= NUCLEO_FRAC * total
+    vale[0] = False  # la etiqueta 0 es el fondo
+    if not vale.all():
+        zona[~vale[etiquetas]] = 0
+    return debil
+
+
 def detectar(frame_bgr):
     """
-    Busca el objetivo elegido en la etapa Calibrar (OBJETIVO): el triángulo rojo o el
-    círculo del láser rojo. Devuelve un dict con al menos "tipo", "x" e "y" [px], o None
-    si no lo encuentra.
+    Busca en el cuadro los candidatos a ser el objetivo elegido en la etapa Calibrar (OBJETIVO):
+    el triángulo rojo o el círculo del láser rojo. Devuelve (candidatos, mascara, descartes):
+      - candidatos: lista de dicts con al menos "tipo", "x", "y" [px] y "area" [px²]. Cuál de
+        ellos es el objetivo lo decide SeguidorObjetivo.
+      - mascara: los píxeles que cuentan como rojo.
+      - descartes: manchas rojas rechazadas por su forma, como (x, y, motivo), para mostrarlas
+        en el video junto con la máscara y saber qué parámetro ajustar.
     """
     blur = cv2.GaussianBlur(frame_bgr, (7, 7), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-    rojo = cv2.inRange(hsv, ROJO1_BAJO, ROJO1_ALTO) | cv2.inRange(hsv, ROJO2_BAJO, ROJO2_ALTO)
+    rojo = mascara_roja(hsv)
 
+    descartes = []
     if OBJETIVO == "laser":
-        return detectar_laser(hsv, rojo)
-    return detectar_triangulo(rojo)
+        return detectar_laser(hsv, rojo, descartes), rojo, descartes
+    return detectar_triangulo(rojo, descartes), rojo, descartes
 
 
 def contornos_de(mascara):
@@ -200,84 +282,153 @@ def contornos_de(mascara):
     return cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
 
 
-def detectar_laser(hsv, rojo):
+def centro_de(contorno):
+    x, y, w, h = cv2.boundingRect(contorno)
+    return x + w // 2, y + h // 2
+
+
+def detectar_laser(hsv, rojo, descartes):
     """
-    Busca el punto del láser rojo: la mancha roja más grande que sea aproximadamente circular.
-    Devuelve un dict con el centro (x, y), el radio [px] y la circularidad medida; o None.
+    Candidatos a punto del láser rojo: manchas rojas aproximadamente circulares.
+    Cada uno es un dict con el centro (x, y), el radio [px], el área y la circularidad medida.
     """
     # Núcleo blanco saturado: solo se acepta si está rodeado de rojo
     kernel = np.ones((5, 5), np.uint8)
     nucleo = cv2.inRange(hsv, NUCLEO_BAJO, NUCLEO_ALTO) & cv2.dilate(rojo, kernel, iterations=2)
 
-    mejor, mejor_area = None, 0
+    candidatos = []
     for c in contornos_de(rojo | nucleo):
         area = cv2.contourArea(c)
-        if area < AREA_MIN_LASER or area <= mejor_area:
+        if area < AREA_MIN_LASER:
             continue
         perimetro = cv2.arcLength(c, True)
         if perimetro == 0:
             continue
         circularidad = 4 * np.pi * area / (perimetro ** 2)
         if circularidad < CIRCULARIDAD_MIN:
+            descartes.append((*centro_de(c), f"circularidad {circularidad:.2f}"))
             continue
 
         (x, y), radio = cv2.minEnclosingCircle(c)
-        mejor, mejor_area = {
+        candidatos.append({
             "tipo": "laser",
             "x": float(x),
             "y": float(y),
+            "area": float(area),
             "radio": float(radio),
             "circularidad": float(circularidad),
-        }, area
+        })
 
-    return mejor
+    return candidatos
 
 
-def detectar_triangulo(rojo):
+def detectar_triangulo(rojo, descartes):
     """
-    Busca el objetivo rojo con forma de triángulo (base/altura ≈ PROPORCION).
-    Devuelve un dict con el centroide (x, y), el triángulo [3 vértices], el vértice
-    de la punta, base y altura [px] y la proporción medida; o None si no lo encuentra.
+    Candidatos a objetivo rojo con forma de triángulo (base/altura ≈ PROPORCION).
+    Cada uno es un dict con el centroide (x, y), el área, el triángulo [3 vértices], el
+    vértice de la punta, base y altura [px] y la proporción medida.
     """
-    contornos = contornos_de(rojo)
-
-    mejor, mejor_area = None, 0
-    for c in contornos:
+    candidatos = []
+    for c in contornos_de(rojo):
         area = cv2.contourArea(c)
-        if area < AREA_MIN or area <= mejor_area:
+        if area < AREA_MIN:
             continue
 
         area_tri, tri = cv2.minEnclosingTriangle(cv2.convexHull(c))
         if area_tri <= 0 or area / area_tri < RELLENO_MIN:
+            descartes.append((*centro_de(c), f"relleno {area / area_tri:.2f}" if area_tri > 0 else "sin forma"))
             continue
         tri = tri.reshape(3, 2)
 
-        # lados[i] = lado opuesto al vértice i. La base es el lado más corto
-        # (81.66 mm frente a ≈108 mm de los otros dos) y su vértice opuesto es la punta.
+        # Proporción base/altura con el rectángulo más chico que encierra al contorno (en
+        # cualquier giro): lado corto = base (envergadura), lado largo = altura (largo).
+        # El triángulo envolvente no sirve para esto: con la silueta real del avión no queda
+        # ajustado a la envergadura y al largo, y da proporciones cercanas a 1.
+        ancho_rect, alto_rect = cv2.minAreaRect(c)[1]
+        base, altura = min(ancho_rect, alto_rect), max(ancho_rect, alto_rect)
+        proporcion = base / altura if altura > 0 else 0.0
+        ocupacion = area / (base * altura) if base > 0 else 1.0
+        if ocupacion > OCUPACION_MAX:
+            descartes.append((*centro_de(c), f"rect {ocupacion:.2f}"))
+            continue
+        if abs(proporcion / PROPORCION - 1) > PROPORCION_TOL:
+            descartes.append((*centro_de(c), f"b/h {proporcion:.2f}"))
+            continue
+
+        # lados[i] = lado opuesto al vértice i del triángulo envolvente. Su lado más corto
+        # hace de base y el vértice opuesto es la punta.
         lados = [float(np.linalg.norm(tri[(i + 1) % 3] - tri[(i + 2) % 3])) for i in range(3)]
         i_punta = int(np.argmin(lados))
-        base = lados[i_punta]
-        altura = 2 * area_tri / base
-        proporcion = base / altura
-        if abs(proporcion / PROPORCION - 1) > PROPORCION_TOL:
-            continue
         largo1, largo2 = (lados[j] for j in range(3) if j != i_punta)
         if abs(largo1 - largo2) / max(largo1, largo2) > ISOSCELES_TOL:
+            descartes.append((*centro_de(c), f"lados {min(largo1, largo2) / max(largo1, largo2):.2f}"))
             continue
 
         mom = cv2.moments(c)
-        mejor, mejor_area = {
+        candidatos.append({
             "tipo": "triangulo",
             "x": mom["m10"] / mom["m00"],
             "y": mom["m01"] / mom["m00"],
+            "area": float(area),
             "tri": tri,
             "punta": tri[i_punta],
             "base": base,
             "altura": altura,
             "proporcion": proporcion,
-        }, area
+        })
 
-    return mejor
+    return candidatos
+
+
+class SeguidorObjetivo:
+    """
+    Decide cuál de los candidatos de cada cuadro es el objetivo, usando lo visto antes:
+      - Un objetivo nuevo solo se acepta tras verlo FRAMES_CONFIRMAR cuadros seguidos en
+        (casi) el mismo lugar: una detección falsa de un solo cuadro no cuenta.
+      - Mientras se sigue un objetivo solo se acepta el candidato más cercano a su última
+        posición, dentro de una distancia máxima ("puerta"): no se salta a otra cosa aunque
+        sea más grande. Si desaparece, se lo espera MEMORIA_S antes de buscar uno nuevo.
+    """
+
+    def __init__(self):
+        self.reiniciar()
+
+    def reiniciar(self):
+        self.pos = None        # última posición aceptada (x, y)
+        self.t = 0.0           # instante de esa posición
+        self.pendiente = None  # posición del candidato que se está confirmando
+        self.cuenta = 0        # cuadros seguidos en que se vio
+
+    @staticmethod
+    def _distancia(candidato, pos):
+        return float(np.hypot(candidato["x"] - pos[0], candidato["y"] - pos[1]))
+
+    def elegir(self, candidatos, t, ancho):
+        """Devuelve el candidato que es el objetivo en el instante t [s], o None."""
+        if self.pos is not None and t - self.t <= MEMORIA_S:
+            # La puerta crece con el tiempo sin verlo: pudo moverse más
+            puerta = ancho * (PUERTA_BASE + PUERTA_POR_S * (t - self.t))
+            cerca = [c for c in candidatos if self._distancia(c, self.pos) <= puerta]
+            if not cerca:
+                return None
+            elegido = min(cerca, key=lambda c: self._distancia(c, self.pos))
+            self.pos, self.t = (elegido["x"], elegido["y"]), t
+            return elegido
+
+        # No se sigue a nadie: confirmar al candidato más grande
+        self.pos = None
+        if not candidatos:
+            self.pendiente, self.cuenta = None, 0
+            return None
+        mayor = max(candidatos, key=lambda c: c["area"])
+        cerca = self.pendiente is not None and self._distancia(mayor, self.pendiente) <= ancho * 2 * PUERTA_BASE
+        self.cuenta = self.cuenta + 1 if cerca else 1
+        self.pendiente = (mayor["x"], mayor["y"])
+        if self.cuenta < FRAMES_CONFIRMAR:
+            return None
+        self.pos, self.t = self.pendiente, t
+        self.pendiente, self.cuenta = None, 0
+        return mayor
 
 
 def calcular_error(x, y, ancho, alto, fov):
@@ -306,10 +457,18 @@ def etiqueta(frame, texto, x, y, escala, grosor):
     cv2.putText(frame, texto, (x + m, y + m + th), FUENTE, escala, (255, 255, 255), grosor, cv2.LINE_AA)
 
 
-def dibujar(frame, objetivo, error, fps):
+def dibujar(frame, objetivo, error, fps, mascara=None, descartes=()):
     alto, ancho = frame.shape[:2]
     cx, cy = ancho // 2, alto // 2
     g = max(1, round(ancho / 640))  # grosor proporcional a la resolución
+
+    if mascara is not None:
+        # Píxeles que cuentan como rojo, en celeste: para ajustar tono, saturación y brillo
+        rojos = mascara > 0
+        frame[rojos] = frame[rojos] // 3 + np.array([170, 170, 0], np.uint8)
+        # Manchas rojas rechazadas por su forma, con el valor que no cumplió
+        for x, y, motivo in descartes:
+            etiqueta(frame, motivo, x + 8 * g, y - 8 * g, 0.4 * g, g)
 
     cv2.drawMarker(frame, (cx, cy), (220, 220, 220), cv2.MARKER_CROSS, 24 * g, g)
 
@@ -380,13 +539,53 @@ def escribir_uart(uart, datos):
         pass  # buffer lleno: se descarta este paquete para no frenar el video
 
 
+def bucle_video():
+    """
+    Dibuja y codifica en JPEG el cuadro más reciente que dejó la detección. Va en su propio
+    hilo: si no alcanza a procesar todos los cuadros se salta los intermedios, sin atrasar
+    a la detección ni a la UART.
+    """
+    global ultimo_jpg, id_video, info_video, cuadro_video
+
+    publicados = deque()  # instantes de publicación del último segundo
+    while True:
+        with hay_cuadro:
+            hay_cuadro.wait_for(lambda: cuadro_video is not None)
+            frame, objetivo, error, fps, mascara, descartes = cuadro_video
+            cuadro_video = None
+
+        t_ini = time.perf_counter()
+        dibujar(frame, objetivo, error, fps, mascara, descartes)
+        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_CALIDAD])
+        t_fin = time.perf_counter()
+        if ok:
+            publicados.append(t_fin)
+            while t_fin - publicados[0] > 1.0:
+                publicados.popleft()
+            fps_video = (len(publicados) - 1) / (t_fin - publicados[0]) if len(publicados) > 1 else 0.0
+            with lock:
+                ultimo_jpg = jpg.tobytes()
+                id_video += 1
+                info_video = {"jpg_kb": round(len(jpg) / 1024, 1), "fps_video": round(fps_video, 1),
+                              "video_ms": round((t_fin - t_ini) * 1000, 1)}
+                nuevo_frame.notify_all()
+
+        # No más de VIDEO_FPS_MAX: el resto del tiempo queda libre para la detección
+        espera = 1.0 / VIDEO_FPS_MAX - (time.perf_counter() - t_ini)
+        if espera > 0:
+            time.sleep(espera)
+
+
 def bucle_camara():
-    global ultimo_jpg, id_frame, estado, etapa
+    global id_frame, estado, etapa, cuadro_video
 
     camara = CamaraPi()
     uart = abrir_uart()
     t0 = time.time()
     t_parametros = 0.0  # último envío de los parámetros del control
+    seguidor = SeguidorObjetivo()
+    tipo_seguido = OBJETIVO
+    ev_aplicado = 0.0
     llegadas = deque()  # instantes de llegada del último segundo
 
     while True:
@@ -402,10 +601,18 @@ def bucle_camara():
         frame = np.ascontiguousarray(frame)
         alto, ancho = frame.shape[:2]
 
-        objetivo = detectar(frame)
+        if EXPOSICION_EV != ev_aplicado:
+            ev_aplicado = EXPOSICION_EV
+            camara.fijar_ev(ev_aplicado)
+        if OBJETIVO != tipo_seguido:  # se eligió otro objetivo: se olvida al anterior
+            tipo_seguido = OBJETIVO
+            seguidor.reiniciar()
+
+        candidatos, mascara, descartes = detectar(frame)
+        objetivo = seguidor.elegir(candidatos, t, ancho)
         error = calcular_error(objetivo["x"], objetivo["y"], ancho, alto, meta["fov"]) if objetivo else None
 
-        # Búsqueda -> Seguimiento en el primer frame en que aparece el objetivo
+        # Búsqueda -> Seguimiento apenas aparece el objetivo (ya confirmado por el seguidor)
         with lock:
             if etapa == BUSQUEDA and objetivo:
                 etapa = SEGUIMIENTO
@@ -427,11 +634,11 @@ def bucle_camara():
             # Seguimiento: solo con objetivo a la vista (la ESP detecta su pérdida por timeout)
             enviar_uart(uart, etapa_frame, ex, ey)
 
-        dibujar(frame, objetivo, error, fps)
-
-        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_CALIDAD])
-        if not ok:
-            continue
+        # El dibujo y el JPEG los hace bucle_video con el cuadro más reciente
+        with hay_cuadro:
+            cuadro_video = (frame, objetivo, error, fps, mascara if VER_MASCARA else None,
+                            descartes if VER_MASCARA else ())
+            hay_cuadro.notify()
         proc_ms = (time.perf_counter() - t_ini) * 1000
 
         nuevo_estado = {
@@ -456,16 +663,13 @@ def bucle_camara():
             "alto": alto,
             "recorte": meta["recorte"],
             "fov": [round(float(v), 1) for v in meta["fov"]],
-            "jpg_kb": round(len(jpg) / 1024, 1),
             "jpeg_calidad": JPEG_CALIDAD,
         }
 
         with lock:
             id_frame += 1
-            ultimo_jpg = jpg.tobytes()
-            estado = nuevo_estado
+            estado = {**nuevo_estado, **info_video}
             historial.append([id_frame, round(t - t0, 3), objetivo is not None, ex, ey, round(fps, 1)])
-            nuevo_frame.notify_all()
 
 
 # ---------------- Servidor web ----------------
@@ -552,6 +756,7 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
 .opciones button.activa{background:var(--s1);border-color:var(--s1);color:#fff;font-weight:600}
 #etapas{margin-bottom:16px}
 #control{margin-top:16px}
+.casilla{display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:13px;color:var(--text-2)}
 #control fieldset{margin-top:16px}
 .etapas{display:flex;flex-wrap:wrap;gap:8px}
 .etapas button{padding:8px 18px}
@@ -580,7 +785,7 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
     <section class="card">
       <h2>Video en tiempo real <span class="num" id="tag-res">—</span></h2>
       <img id="video" src="/video" alt="Video de la cámara con el objetivo detectado">
-      <p class="nota">Cruz = centro de la imagen · contorno magenta = objetivo · flecha = error de posición</p>
+      <p class="nota">Cruz = centro de la imagen · contorno magenta = objetivo · flecha = error de posición · celeste = píxeles que cuentan como rojo (con la máscara activada)</p>
     </section>
     <section class="card">
       <h2>Error de posición vs tiempo <span>últimos 10 s</span></h2>
@@ -608,9 +813,10 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
     </section>
 
     <section class="card">
-      <h2>FPS del video</h2>
+      <h2>FPS de la detección</h2>
       <div class="hero"><b id="fps">—</b><span>FPS medidos</span></div>
-      <div class="sub">Nominal cámara <b id="fps-nom">—</b> · Procesamiento <b id="proc">—</b> ms/frame</div>
+      <div class="sub">Nominal cámara <b id="fps-nom">—</b> · Detección <b id="proc">—</b> ms/frame</div>
+      <div class="sub">Video del dashboard <b id="fps-video">—</b> FPS · <b id="video-ms">—</b> ms/frame</div>
       <div class="chart-wrap"><canvas id="g-fps" class="chart small"></canvas><div class="tip" hidden></div></div>
     </section>
 
@@ -657,6 +863,13 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
 
 <section class="card" id="ajustes">
   <h2>Calibración <span id="ajustes-estado">solo se puede modificar en la etapa Calibrar</span></h2>
+  <label class="casilla"><input type="checkbox" id="ver-mascara">
+    Ver en el video los píxeles que cuentan como rojo y por qué se descarta cada mancha
+    (se puede activar en cualquier etapa)</label>
+  <p class="nota" style="margin:0 0 12px">Etiquetas sobre una mancha roja descartada: «relleno» está bajo el relleno mínimo ·
+    «rect» ocupa demasiado del rectángulo que la encierra (óvalos y rectángulos, sobre 0,70) ·
+    «b/h» es su proporción base/altura, fuera de la tolerancia · «lados» son sus dos lados largos, muy distintos ·
+    «circularidad» está bajo la mínima del láser. Las manchas más chicas que el área mínima no llevan etiqueta.</p>
   <fieldset class="solo-calibrar" disabled>
     <div class="campo"><span>Objetivo a seguir</span>
       <div class="opciones" id="objetivos">
@@ -676,6 +889,21 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
       <label class="campo"><span>Láser · circularidad mínima (CIRCULARIDAD_MIN)</span>
         <input type="number" id="circ-min" min="0.01" max="1" step="0.01" required>
         <small>1 = círculo perfecto</small></label>
+      <label class="campo"><span>Rojo · tono máximo (TONO_MAX)</span>
+        <input type="number" id="tono-max" min="0" max="15" step="1" required>
+        <small>0 a 15 · sobre ~7 empieza a entrar la piel</small></label>
+      <label class="campo"><span>Rojo · saturación mínima (SAT_MIN)</span>
+        <input type="number" id="sat-min" min="0" max="255" step="1" required>
+        <small>0 a 255 · avión ≈ 200, labios y piel hasta ≈ 157 · los bordes aceptan hasta 50 menos</small></label>
+      <label class="campo"><span>Rojo · brillo mínimo (BRILLO_MIN)</span>
+        <input type="number" id="brillo-min" min="0" max="255" step="1" required>
+        <small>0 a 255 · bajarlo si el objetivo está a contraluz</small></label>
+      <label class="campo"><span>Triángulo · relleno mínimo (RELLENO_MIN)</span>
+        <input type="number" id="relleno-min" min="0.3" max="1" step="0.01" required>
+        <small>parte del triángulo envolvente que llena el objetivo · subirlo puede descartar al avión</small></label>
+      <label class="campo"><span>Cámara · compensación de exposición [EV]</span>
+        <input type="number" id="exposicion-ev" min="-4" max="4" step="0.25" required>
+        <small>positiva aclara: para objetivos a contraluz</small></label>
       <div class="botones">
         <button type="submit" class="principal">Guardar</button>
         <button type="button" id="restablecer">Valores por defecto</button>
@@ -952,6 +1180,8 @@ function pintarEstado(d) {
   $('fps').textContent = d.fps.toFixed(1);
   $('fps-nom').textContent = d.fps_nominal ? d.fps_nominal.toFixed(1) : '—';
   $('proc').textContent = d.proc_ms.toFixed(1);
+  $('fps-video').textContent = d.fps_video.toFixed(1);
+  $('video-ms').textContent = d.video_ms.toFixed(1);
 
   $('tag-res').textContent = `${d.ancho}×${d.alto}`;
   $('res').textContent = `${d.ancho} × ${d.alto} px`;
@@ -962,7 +1192,7 @@ function pintarEstado(d) {
     ? `${par(d.recorte)} (${(100 * d.recorte[0] / d.sensor[0]).toFixed(0)} % del ancho)` : '—';
   $('fov').textContent = `${d.fov_supuesto ? '≈ ' : ''}${d.fov[0].toFixed(1)}° × ${d.fov[1].toFixed(1)}°`
     + (d.fov_supuesto ? ' (supuesto)' : '');
-  $('jpg').textContent = `${d.jpg_kb.toFixed(1)} kB/frame · calidad ${d.jpeg_calidad} · ≈ ${(d.jpg_kb * d.fps / 1024).toFixed(2)} MB/s`;
+  $('jpg').textContent = `${d.jpg_kb.toFixed(1)} kB/frame · calidad ${d.jpeg_calidad} · ≈ ${(d.jpg_kb * d.fps_video / 1024).toFixed(2)} MB/s`;
   $('fuente').textContent = d.fuente;
 
   const ar = `${d.ancho} / ${d.alto}`;
@@ -1026,6 +1256,12 @@ function mostrarAjustes(a) {
   $('prop-tol').value = a.proporcion_tol;
   $('area-min-laser').value = a.area_min_laser;
   $('circ-min').value = a.circularidad_min;
+  $('tono-max').value = a.tono_max;
+  $('sat-min').value = a.sat_min;
+  $('brillo-min').value = a.brillo_min;
+  $('relleno-min').value = a.relleno_min;
+  $('exposicion-ev').value = a.exposicion_ev;
+  $('ver-mascara').checked = a.ver_mascara;
   $('omega-max').value = a.omega_max;
   $('kp-pan').value = a.kp_pan;
   $('ki-pan').value = a.ki_pan;
@@ -1055,8 +1291,12 @@ $('prop-tol').addEventListener('input', mostrarRango);
 $('form-ajustes').addEventListener('submit', e => {
   e.preventDefault();
   enviarAjustes({area_min: Number($('area-min').value), proporcion_tol: Number($('prop-tol').value),
-                 area_min_laser: Number($('area-min-laser').value), circularidad_min: Number($('circ-min').value)});
+                 area_min_laser: Number($('area-min-laser').value), circularidad_min: Number($('circ-min').value),
+                 tono_max: Number($('tono-max').value), sat_min: Number($('sat-min').value),
+                 brillo_min: Number($('brillo-min').value), relleno_min: Number($('relleno-min').value),
+                 exposicion_ev: Number($('exposicion-ev').value)});
 });
+$('ver-mascara').addEventListener('change', e => enviarAjustes({ver_mascara: e.target.checked}));
 for (const b of document.querySelectorAll('#objetivos button'))
   b.addEventListener('click', () => enviarAjustes({objetivo: b.dataset.objetivo}));
 $('omega-max').addEventListener('input', mostrarOmegaGrados);
@@ -1097,8 +1337,8 @@ def generador_mjpeg():
     visto = -1
     while True:
         with nuevo_frame:
-            nuevo_frame.wait_for(lambda: id_frame != visto, timeout=1.0)
-            jpg, visto = ultimo_jpg, id_frame
+            nuevo_frame.wait_for(lambda: id_video != visto, timeout=1.0)
+            jpg, visto = ultimo_jpg, id_video
         if jpg is not None:
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
 
@@ -1133,6 +1373,11 @@ AJUSTES_NUMERICOS = {
     "proporcion_tol": (0.01, 1, 3),
     "area_min_laser": (1, ANCHO * ALTO, 0),
     "circularidad_min": (0.01, 1, 3),
+    "tono_max": (0, 15, 0),
+    "sat_min": (0, 255, 0),
+    "brillo_min": (0, 255, 0),
+    "relleno_min": (0.3, 1, 3),
+    "exposicion_ev": (-4, 4, 2),
     "omega_max": (0.1, 10, 3),
     "kp_pan": (0, 50, 3),
     "ki_pan": (0, 50, 3),
@@ -1140,12 +1385,14 @@ AJUSTES_NUMERICOS = {
     "ki_tilt": (0, 50, 3),
 }
 AJUSTES_CONTROL = ("omega_max", "kp_pan", "ki_pan", "kp_tilt", "ki_tilt")  # los que se envían a la ESP
-AJUSTES_LIBRES = ("omega_max",)  # se pueden cambiar en cualquier etapa; el resto solo en Calibrar
+AJUSTES_LIBRES = ("omega_max", "ver_mascara")  # se pueden cambiar en cualquier etapa; el resto solo en Calibrar
 
 
 def ajustes_actuales():
     return {"objetivo": OBJETIVO, "area_min": AREA_MIN, "proporcion_tol": PROPORCION_TOL,
             "area_min_laser": AREA_MIN_LASER, "circularidad_min": CIRCULARIDAD_MIN,
+            "tono_max": TONO_MAX, "sat_min": SAT_MIN, "brillo_min": BRILLO_MIN,
+            "relleno_min": RELLENO_MIN, "exposicion_ev": EXPOSICION_EV, "ver_mascara": VER_MASCARA,
             "omega_max": OMEGA_MAX, "kp_pan": KP_PAN, "ki_pan": KI_PAN,
             "kp_tilt": KP_TILT, "ki_tilt": KI_TILT}
 
@@ -1162,6 +1409,8 @@ def validar_ajustes(datos):
 
     if a["objetivo"] not in OBJETIVOS:
         raise ValueError('objetivo debe ser "triangulo" o "laser"')
+    if not isinstance(a["ver_mascara"], bool):
+        raise ValueError("ver_mascara debe ser true o false")
     for k, (minimo, maximo, decimales) in AJUSTES_NUMERICOS.items():
         try:
             a[k] = float(a[k])
@@ -1176,7 +1425,10 @@ def validar_ajustes(datos):
 def aplicar_ajustes(datos, guardar):
     global OBJETIVO, AREA_MIN, PROPORCION_TOL, AREA_MIN_LASER, CIRCULARIDAD_MIN
     global OMEGA_MAX, KP_PAN, KI_PAN, KP_TILT, KI_TILT
+    global TONO_MAX, SAT_MIN, BRILLO_MIN, RELLENO_MIN, EXPOSICION_EV, VER_MASCARA
     a = validar_ajustes(datos)
+    TONO_MAX, SAT_MIN, BRILLO_MIN = a["tono_max"], a["sat_min"], a["brillo_min"]
+    RELLENO_MIN, EXPOSICION_EV, VER_MASCARA = a["relleno_min"], a["exposicion_ev"], a["ver_mascara"]
     OBJETIVO, AREA_MIN, PROPORCION_TOL = a["objetivo"], a["area_min"], a["proporcion_tol"]
     AREA_MIN_LASER, CIRCULARIDAD_MIN = a["area_min_laser"], a["circularidad_min"]
     OMEGA_MAX, KP_PAN, KI_PAN, KP_TILT, KI_TILT = (a[k] for k in AJUSTES_CONTROL)
@@ -1200,7 +1452,8 @@ def cargar_ajustes():
 def ajustes():
     """
     GET: ajustes actuales. POST: cambia los que se envíen. La velocidad máxima (omega_max)
-    se puede cambiar en cualquier etapa; todos los demás, solo durante la etapa Calibrar.
+    y la vista de la máscara (ver_mascara) se pueden cambiar en cualquier etapa; todos los
+    demás, solo durante la etapa Calibrar.
     """
     if request.method == "POST":
         datos = request.get_json(silent=True)
@@ -1211,7 +1464,7 @@ def ajustes():
             # Con `lock` tomado la etapa no puede cambiar entre la revisión y el cambio
             with lock:
                 if solo_calibrar and etapa != CALIBRAR:
-                    return jsonify(error="fuera de la etapa Calibrar solo se puede cambiar la velocidad máxima"), 409
+                    return jsonify(error="fuera de la etapa Calibrar solo se pueden cambiar la velocidad máxima y la vista de la máscara"), 409
                 aplicar_ajustes(datos, guardar=True)
         except ValueError as e:
             return jsonify(error=str(e)), 400
@@ -1223,4 +1476,5 @@ def ajustes():
 if __name__ == "__main__":
     cargar_ajustes()
     threading.Thread(target=bucle_camara, daemon=True).start()
+    threading.Thread(target=bucle_video, daemon=True).start()
     app.run(host="0.0.0.0", port=PUERTO, threaded=True)
