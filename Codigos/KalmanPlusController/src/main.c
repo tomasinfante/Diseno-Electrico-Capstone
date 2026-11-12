@@ -2,7 +2,8 @@
  * Controlador pan-tilt: la Raspberry Pi le informa la etapa del programa y el error del objetivo
  * en la imagen, y este programa mueve los dos motores paso a paso según la etapa:
  *     Detenido     motores detenidos
- *     Calibrar     motores detenidos (en la página se eligen el objetivo y los parámetros)
+ *     Calibrar     motores liberados: la plataforma se acomoda a mano y la posición en que
+ *                  queda al salir de la etapa pasa a ser el ángulo cero de cada eje
  *     Búsqueda     barrido suave y periódico en pan y tilt, hasta que la cámara ve al objetivo
  *     Seguimiento  un filtro de Kalman por eje estima la dirección del objetivo y un PI de
  *                  velocidad lleva la plataforma hacia esa estimación
@@ -140,6 +141,10 @@ static const ConfigBarrido CONFIG_BARRIDO_TILT = {
 // ninguno se asume que se cortó la comunicación y los motores se detienen
 #define T_SIN_ENLACE 0.5f
 
+// Al salir de Calibrar los drivers se vuelven a habilitar y cada motor se acomoda en su paso
+// más cercano: se espera este tiempo [s] con los motores quietos antes de fijar el cero
+#define T_ASENTAR 0.2f
+
 // Ganancias iniciales: las reemplazan las que envía la Raspberry (se ajustan desde la página).
 // tPrediccion = 0: la predicción sin objetivo la hace el filtro de Kalman (T_PREDICCION), no el PI
 static const ConfigControlPi CONFIG_CONTROL_PAN = {
@@ -173,7 +178,7 @@ static Barrido barridoPan;
 static Barrido barridoTilt;
 
 // ---------------- Ángulos ----------------
-// Ángulo comandado a cada eje desde el arranque [rad]: la integral de la velocidad pedida al motor
+// Ángulo comandado a cada eje desde el cero [rad]: la integral de la velocidad pedida al motor
 static float thetaCmdPan;
 static float thetaCmdTilt;
 
@@ -187,7 +192,8 @@ static void moverEjes(float omegaPan, float omegaTilt)
 }
 
 // Ángulo actual de un eje de la plataforma [rad]: el que mide el encoder o, si el sensor
-// no está, el comandado. El cero (α = β = 0) es la posición de arranque.
+// no está, el comandado. El cero (α = β = 0) es la posición de arranque o la que se dejó
+// a mano en la etapa Calibrar.
 static float anguloEje(EncoderAs5600 *enc, float thetaCmd)
 {
     float angulo;
@@ -296,6 +302,47 @@ static void pasoSeguimiento(bool entrando, const ErrorObjetivo *medicion, bool v
     moverEjes(controlPiPaso(&controlPan, ePan, estimado), controlPiPaso(&controlTilt, eTilt, estimado));
 }
 
+// Calibrar: los motores quedan liberados para acomodar la plataforma a mano, y la posición en
+// que queda al salir de la etapa pasa a ser el cero (α = β = 0). Se llama en todos los pasos
+// del lazo; devuelve true mientras la calibración no termina (el resto del control no corre).
+static bool pasoCalibrar(EtapaPrograma etapa)
+{
+    static bool liberados = false;
+    static int pasosAsentar = 0;  // pasos del lazo que faltan para fijar el cero
+
+    if (etapa == ETAPA_CALIBRAR) {
+        if (!liberados) {
+            motorPasosHabilitar(&motorPan, false);
+            motorPasosHabilitar(&motorTilt, false);
+            liberados = true;
+            ESP_LOGI(TAG, "Calibrar: motores liberados, acomodar la plataforma a mano");
+        }
+        return true;
+    }
+
+    if (liberados) {  // se salió de Calibrar: los motores vuelven a sujetar la plataforma
+        motorPasosHabilitar(&motorPan, true);
+        motorPasosHabilitar(&motorTilt, true);
+        liberados = false;
+        pasosAsentar = (int)(T_ASENTAR / TS);
+    }
+
+    if (pasosAsentar > 0) {
+        moverEjes(0.0f, 0.0f);
+        pasosAsentar--;
+        if (pasosAsentar == 0) {
+            encoderAs5600FijarCero(&encoderPan);
+            encoderAs5600FijarCero(&encoderTilt);
+            thetaCmdPan = 0.0f;
+            thetaCmdTilt = 0.0f;
+            ESP_LOGI(TAG, "Calibrar: esta posicion es el angulo cero de pan y tilt");
+        }
+        return true;
+    }
+
+    return false;
+}
+
 // Búsqueda: barrido suave y periódico de los dos ejes, partiendo desde donde está la plataforma
 static void pasoBusqueda(bool entrando, float alfa, float beta, float omegaMax)
 {
@@ -326,6 +373,12 @@ static void tareaControl(void *arg)
             etapa = ETAPA_DETENIDO;
         }
 
+        // Calibrar (y el momento en que se fija el cero al salir): el resto del control espera
+        if (pasoCalibrar(etapa)) {
+            etapaAnterior = ETAPA_CALIBRAR;
+            continue;
+        }
+
         float alfa = anguloEje(&encoderPan, thetaCmdPan);
         float beta = anguloEje(&encoderTilt, thetaCmdTilt);
         bool entrando = etapa != etapaAnterior;
@@ -343,7 +396,6 @@ static void tareaControl(void *arg)
                 break;
 
             case ETAPA_DETENIDO:
-            case ETAPA_CALIBRAR:
             default:
                 moverEjes(0.0f, 0.0f);
                 break;

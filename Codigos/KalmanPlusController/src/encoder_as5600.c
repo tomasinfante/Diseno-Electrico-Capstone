@@ -124,6 +124,13 @@ bool encoderAs5600Leer(EncoderAs5600 *enc, float *angulo)
     return true;
 }
 
+void encoderAs5600FijarCero(EncoderAs5600 *enc)
+{
+    taskENTER_CRITICAL(&enc->mux);
+    enc->cuentas = 0;
+    taskEXIT_CRITICAL(&enc->mux);
+}
+
 uint32_t encoderAs5600Errores(EncoderAs5600 *enc)
 {
     taskENTER_CRITICAL(&enc->mux);

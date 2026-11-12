@@ -132,3 +132,9 @@ void motorPasosFijarVelocidad(MotorPasos *m, float omega)
     float pasosS = fminf(fmaxf(m->config.signo * omega * m->pasosPorRad, -MAX_PASOS_S), MAX_PASOS_S);
     m->incremento = (int32_t)(pasosS / FRECUENCIA_TICK_HZ * UN_PASO_Q16);
 }
+
+void motorPasosHabilitar(MotorPasos *m, bool habilitar)
+{
+    m->incremento = 0;
+    gpio_set_level(m->config.pines.en, habilitar ? 0 : 1);  // EN es activo en bajo
+}

@@ -45,3 +45,8 @@ void motorPasosIniciar(MotorPasos *m, const ConfigMotorPasos *config);
 
 // Fija la velocidad del eje de la plataforma [rad/s]. Se puede llamar desde cualquier tarea.
 void motorPasosFijarVelocidad(MotorPasos *m, float omega);
+
+// Habilita o libera el driver. Liberado, el motor queda sin corriente y el eje se puede girar
+// a mano; la velocidad queda en cero. Al habilitarlo de nuevo el motor se acomoda en el paso
+// más cercano (hasta un par de pasos completos).
+void motorPasosHabilitar(MotorPasos *m, bool habilitar);
