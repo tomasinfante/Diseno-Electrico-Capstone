@@ -27,6 +27,7 @@ Paquete de parámetros del control, 13 bytes: 0xAA | 0x10 | 5 valores uint16 en 
 """
 
 import json
+import re
 import struct
 import threading
 import time
@@ -109,8 +110,28 @@ MEMORIA_S = 0.3         # s; si el objetivo desaparece, durante este tiempo no s
 PUERTA_BASE = 0.10      # distancia máxima entre cuadros, en anchos de imagen...
 PUERTA_POR_S = 3.0      # ...más lo que puede moverse por segundo, también en anchos de imagen
 
-# Qué se sigue: "triangulo" (la figura triangular) o "laser" (el círculo del láser)
-OBJETIVOS = ("triangulo", "laser")
+# Objetivo desconocido: una figura de un color cualquiera, con forma de círculo, triángulo o
+# cuadrado. Se elige en Calibrar (el color también se puede tomar tocando el objeto en el video).
+# Una mancha del color vale si cubre al menos FIGURA_COBERTURA_MIN de la figura más chica de
+# esa forma que la encierra. Eso mismo separa las formas: un círculo cubre 0.79 del cuadrado
+# que lo encierra y 0.60 del triángulo, un cuadrado 0.64 del círculo y 0.50 del triángulo, y
+# un triángulo 0.41 del círculo y 0.50 del rectángulo.
+FORMAS = ("circulo", "triangulo", "cuadrado")
+FIGURA_FORMA = "circulo"
+FIGURA_COLOR = "#1e64dc"     # color del objeto, en hexadecimal RGB
+FIGURA_TONO_TOL = 10         # diferencia de tono aceptada (el tono de OpenCV va de 0 a 179)
+FIGURA_SAT_MIN = 80          # saturación mínima de los píxeles del objeto (0 a 255)
+FIGURA_COBERTURA_MIN = 0.85  # parte de la figura envolvente que debe tener el color
+FIGURA_AREA_MIN = 350        # px^2; más chica, la forma no se distingue (círculo de 20 px ≈ 314)
+CUADRADO_TOL = 0.25          # el cuadrado acepta lado corto / lado largo desde 1 - CUADRADO_TOL
+# Bajo esta saturación el color elegido no tiene tono (blanco, gris o negro): entonces se
+# aceptan los píxeles poco saturados con un brillo parecido al suyo
+GRIS_SAT_MAX = 50
+GRIS_BRILLO_TOL = 50
+
+# Qué se sigue: "triangulo" (la figura triangular roja), "laser" (el círculo del láser) o
+# "figura" (la figura de forma y color elegidos)
+OBJETIVOS = ("triangulo", "laser", "figura")
 OBJETIVO = "triangulo"
 
 # Parámetros del control que corre en la ESP: se le envían por la UART
@@ -148,6 +169,7 @@ id_frame = 0                               # cuenta los cuadros procesados (dete
 info_video = {"jpg_kb": 0.0, "fps_video": 0.0, "video_ms": 0.0}
 hay_cuadro = threading.Condition()         # la detección dejó un cuadro para el hilo del video
 cuadro_video = None                        # (frame, objetivo, error, fps, mascara, descartes)
+ultimo_frame = None                        # último cuadro de la cámara, sin dibujar (para tomar colores)
 estado = None
 historial = deque(maxlen=HISTORIAL_MAX)  # [id, t, detectado, ex, ey, fps]
 
@@ -254,32 +276,65 @@ def mascara_roja(hsv):
     return debil
 
 
+def color_hsv(hexadecimal):
+    """Color "#rrggbb" en el HSV de OpenCV: (tono 0..179, saturación 0..255, brillo 0..255)."""
+    r, g, b = (int(hexadecimal[i:i + 2], 16) for i in (1, 3, 5))
+    return tuple(int(v) for v in cv2.cvtColor(np.uint8([[[b, g, r]]]), cv2.COLOR_BGR2HSV)[0, 0])
+
+
+def mascara_color(hsv):
+    """Píxeles del color de la figura (FIGURA_COLOR)."""
+    h, s, v = color_hsv(FIGURA_COLOR)
+    if s < GRIS_SAT_MAX:  # sin tono: blanco, gris o negro
+        return cv2.inRange(hsv, (0, 0, max(v - GRIS_BRILLO_TOL, 0)),
+                           (179, GRIS_SAT_MAX, min(v + GRIS_BRILLO_TOL, 255)))
+
+    # El tono es circular (179 es vecino de 0): si la banda pasa por un extremo, se parte en dos
+    bajo, alto = h - FIGURA_TONO_TOL, h + FIGURA_TONO_TOL
+    def banda(t0, t1):
+        return cv2.inRange(hsv, (t0, FIGURA_SAT_MIN, BRILLO_MIN), (t1, 255, 255))
+    if bajo < 0:
+        return banda(0, alto) | banda(180 + bajo, 179)
+    if alto > 179:
+        return banda(bajo, 179) | banda(0, alto - 180)
+    return banda(bajo, alto)
+
+
 def detectar(frame_bgr):
     """
     Busca en el cuadro los candidatos a ser el objetivo elegido en la etapa Calibrar (OBJETIVO):
-    el triángulo rojo o el círculo del láser rojo. Devuelve (candidatos, mascara, descartes):
+    el triángulo rojo, el círculo del láser rojo o la figura de forma y color elegidos.
+    Devuelve (candidatos, mascara, descartes):
       - candidatos: lista de dicts con al menos "tipo", "x", "y" [px] y "area" [px²]. Cuál de
         ellos es el objetivo lo decide SeguidorObjetivo.
-      - mascara: los píxeles que cuentan como rojo.
-      - descartes: manchas rojas rechazadas por su forma, como (x, y, motivo), para mostrarlas
-        en el video junto con la máscara y saber qué parámetro ajustar.
+      - mascara: los píxeles que cuentan como del color del objetivo.
+      - descartes: manchas de ese color rechazadas por su forma, como (x, y, motivo), para
+        mostrarlas en el video junto con la máscara y saber qué parámetro ajustar.
     """
     blur = cv2.GaussianBlur(frame_bgr, (7, 7), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-    rojo = mascara_roja(hsv)
 
     descartes = []
+    if OBJETIVO == "figura":
+        color = mascara_color(hsv)
+        return detectar_figura(color, descartes), color, descartes
+
+    rojo = mascara_roja(hsv)
     if OBJETIVO == "laser":
         return detectar_laser(hsv, rojo, descartes), rojo, descartes
     return detectar_triangulo(rojo, descartes), rojo, descartes
 
 
-def contornos_de(mascara):
-    """Limpia la máscara (quita motas y cierra huecos) y devuelve sus contornos externos."""
+def limpiar(mascara):
+    """Quita las motas de la máscara y cierra sus huecos chicos."""
     kernel = np.ones((5, 5), np.uint8)
     mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel, iterations=1)
-    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
-    return cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+    return cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+
+def contornos_de(mascara):
+    """Limpia la máscara y devuelve sus contornos externos."""
+    return cv2.findContours(limpiar(mascara), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
 
 
 def centro_de(contorno):
@@ -328,11 +383,29 @@ def detectar_triangulo(rojo, descartes):
     Cada uno es un dict con el centroide (x, y), el área, el triángulo [3 vértices], el
     vértice de la punta, base y altura [px] y la proporción medida.
     """
+    # La limpieza (apertura 5x5) decide qué manchas existen, pero no sirve para medir su forma:
+    # con el avión lejos (~12 px) le corta la punta y la cola y lo deja como un bulto redondo.
+    # La forma se mide en la máscara con solo sus huecos chicos cerrados.
+    forma = cv2.morphologyEx(rojo, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    alto_img, ancho_img = rojo.shape
+
     candidatos = []
     for c in contornos_de(rojo):
         area = cv2.contourArea(c)
         if area < AREA_MIN:
             continue
+
+        # Contorno de la misma mancha sin la apertura: el más grande cerca de ella
+        x, y, w, h = cv2.boundingRect(c)
+        x0, y0 = max(x - 6, 0), max(y - 6, 0)
+        x1, y1 = min(x + w + 6, ancho_img), min(y + h + 6, alto_img)
+        cercanos = cv2.findContours(forma[y0:y1, x0:x1], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+                                    offset=(x0, y0))[0]
+        if cercanos:
+            c = max(cercanos, key=cv2.contourArea)
+            area = cv2.contourArea(c)
+            if area <= 0:
+                continue
 
         area_tri, tri = cv2.minEnclosingTriangle(cv2.convexHull(c))
         if area_tri <= 0 or area / area_tri < RELLENO_MIN:
@@ -370,11 +443,92 @@ def detectar_triangulo(rojo, descartes):
             "x": mom["m10"] / mom["m00"],
             "y": mom["m01"] / mom["m00"],
             "area": float(area),
-            "tri": tri,
+            "poligono": tri,
             "punta": tri[i_punta],
             "base": base,
             "altura": altura,
             "proporcion": proporcion,
+        })
+
+    return candidatos
+
+
+def figura_envolvente(c):
+    """
+    La figura más chica de forma FIGURA_FORMA que encierra al contorno c. Devuelve
+    (dibujar, datos): dibujar(imagen, desplazamiento) la pinta rellena, y datos va al
+    candidato ("radio" del círculo o "poligono" del triángulo y del cuadrado). Si la mancha
+    no puede tener esa forma devuelve (None, motivo).
+    """
+    if FIGURA_FORMA == "circulo":
+        (x, y), r = cv2.minEnclosingCircle(c)
+        def dibujar(img, d):
+            cv2.circle(img, (int(round(x - d[0])), int(round(y - d[1]))), max(int(round(r)), 1), 255, -1)
+        return dibujar, {"radio": float(r), "caja": (x - r, y - r, x + r, y + r)}
+
+    if FIGURA_FORMA == "triangulo":
+        area_tri, tri = cv2.minEnclosingTriangle(cv2.convexHull(c))
+        if area_tri <= 0:
+            return None, "sin forma"
+        poligono = tri.reshape(3, 2)
+    else:
+        rect = cv2.minAreaRect(c)
+        lado1, lado2 = rect[1]
+        razon = min(lado1, lado2) / max(lado1, lado2) if max(lado1, lado2) > 0 else 0.0
+        if razon < 1 - CUADRADO_TOL:
+            return None, f"lados {razon:.2f}"
+        poligono = cv2.boxPoints(rect)
+
+    def dibujar(img, d):
+        cv2.fillPoly(img, [np.round(poligono - d).astype(np.int32)], 255)
+    return dibujar, {"poligono": poligono, "caja": (*poligono.min(axis=0), *poligono.max(axis=0))}
+
+
+def detectar_figura(color, descartes):
+    """
+    Candidatos a figura de color FIGURA_COLOR y forma FIGURA_FORMA: manchas del color que
+    cubren al menos FIGURA_COBERTURA_MIN de la figura envolvente de esa forma. Cada uno es un
+    dict con el centroide (x, y), el área, la cobertura medida y la figura envolvente.
+    """
+    limpia = limpiar(color)
+    # La cobertura se cuenta en la máscara solo con los huecos cerrados: la apertura de
+    # limpiar() redondea las esquinas y haría que un triángulo chico cubra menos de su figura
+    cerrada = cv2.morphologyEx(color, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2)
+    alto, ancho = limpia.shape
+    candidatos = []
+    for c in cv2.findContours(limpia, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+        area = cv2.contourArea(c)
+        if area < FIGURA_AREA_MIN:
+            continue
+
+        dibujar_env, datos = figura_envolvente(c)
+        if dibujar_env is None:
+            descartes.append((*centro_de(c), datos))
+            continue
+
+        # Cobertura: píxeles del color dentro de la figura envolvente / píxeles de la figura.
+        # Se cuenta solo en el rectángulo que la contiene (y dentro de la imagen).
+        x0, y0, x1, y1 = datos.pop("caja")
+        x0, y0 = max(int(np.floor(x0)), 0), max(int(np.floor(y0)), 0)
+        x1, y1 = min(int(np.ceil(x1)) + 1, ancho), min(int(np.ceil(y1)) + 1, alto)
+        figura = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        dibujar_env(figura, (x0, y0))
+        total = cv2.countNonZero(figura)
+        cubierto = cv2.countNonZero(figura & cerrada[y0:y1, x0:x1])
+        cobertura = cubierto / total if total else 0.0
+        if cobertura < FIGURA_COBERTURA_MIN:
+            descartes.append((*centro_de(c), f"cobertura {cobertura:.2f}"))
+            continue
+
+        mom = cv2.moments(c)
+        candidatos.append({
+            "tipo": "figura",
+            "forma": FIGURA_FORMA,
+            "x": mom["m10"] / mom["m00"],
+            "y": mom["m01"] / mom["m00"],
+            "area": float(area),
+            "cobertura": float(cobertura),
+            **datos,
         })
 
     return candidatos
@@ -463,10 +617,10 @@ def dibujar(frame, objetivo, error, fps, mascara=None, descartes=()):
     g = max(1, round(ancho / 640))  # grosor proporcional a la resolución
 
     if mascara is not None:
-        # Píxeles que cuentan como rojo, en celeste: para ajustar tono, saturación y brillo
+        # Píxeles que cuentan como del color del objetivo, en celeste: para ajustar tono, saturación y brillo
         rojos = mascara > 0
         frame[rojos] = frame[rojos] // 3 + np.array([170, 170, 0], np.uint8)
-        # Manchas rojas rechazadas por su forma, con el valor que no cumplió
+        # Manchas rechazadas por su forma, con el valor que no cumplió
         for x, y, motivo in descartes:
             etiqueta(frame, motivo, x + 8 * g, y - 8 * g, 0.4 * g, g)
 
@@ -477,16 +631,17 @@ def dibujar(frame, objetivo, error, fps, mascara=None, descartes=()):
         largo = max(np.hypot(x - cx, y - cy), 1)
         cv2.arrowedLine(frame, (cx, cy), (x, y), (0, 220, 255), g, cv2.LINE_AA,
                         tipLength=min(0.3, 12 * g / largo))
-        if objetivo["tipo"] == "laser":
+        if "radio" in objetivo:  # láser o figura circular: su círculo envolvente
             r = int(round(objetivo["radio"]))
             cv2.circle(frame, (x, y), r, (255, 0, 255), 2 * g, cv2.LINE_AA)
             x_min, x_max = x - r, x + r
-        else:
-            tri = np.round(objetivo["tri"]).astype(np.int32)
-            cv2.polylines(frame, [tri], True, (255, 0, 255), 2 * g, cv2.LINE_AA)
-            px, py = (int(round(v)) for v in objetivo["punta"])
-            cv2.circle(frame, (px, py), 4 * g, (255, 255, 0), -1)  # punta del triángulo
-            x_min, x_max = int(tri[:, 0].min()), int(tri[:, 0].max())
+        else:  # triángulo o cuadrado envolvente
+            poli = np.round(objetivo["poligono"]).astype(np.int32)
+            cv2.polylines(frame, [poli], True, (255, 0, 255), 2 * g, cv2.LINE_AA)
+            if "punta" in objetivo:
+                px, py = (int(round(v)) for v in objetivo["punta"])
+                cv2.circle(frame, (px, py), 4 * g, (255, 255, 0), -1)  # punta del triángulo
+            x_min, x_max = int(poli[:, 0].min()), int(poli[:, 0].max())
         cv2.circle(frame, (x, y), 3 * g, (255, 0, 255), -1)
 
         # El texto va a la derecha del objetivo, o a la izquierda si no cabe
@@ -555,6 +710,7 @@ def bucle_video():
             cuadro_video = None
 
         t_ini = time.perf_counter()
+        frame = frame.copy()  # el original queda sin dibujar en ultimo_frame
         dibujar(frame, objetivo, error, fps, mascara, descartes)
         ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_CALIDAD])
         t_fin = time.perf_counter()
@@ -577,7 +733,7 @@ def bucle_video():
 
 
 def bucle_camara():
-    global id_frame, estado, etapa, cuadro_video
+    global id_frame, estado, etapa, cuadro_video, ultimo_frame
 
     camara = CamaraPi()
     uart = abrir_uart()
@@ -635,6 +791,7 @@ def bucle_camara():
             enviar_uart(uart, etapa_frame, ex, ey)
 
         # El dibujo y el JPEG los hace bucle_video con el cuadro más reciente
+        ultimo_frame = frame
         with hay_cuadro:
             cuadro_video = (frame, objetivo, error, fps, mascara if VER_MASCARA else None,
                             descartes if VER_MASCARA else ())
@@ -648,9 +805,11 @@ def bucle_camara():
             "x": round(objetivo["x"], 1) if objetivo else None,
             "y": round(objetivo["y"], 1) if objetivo else None,
             "objetivo": OBJETIVO,
-            # Según el tipo de objetivo: base, altura y proporción (triángulo) o radio y circularidad (láser)
+            # Según el tipo de objetivo: base, altura y proporción (triángulo), radio y
+            # circularidad (láser) o cobertura y radio (figura)
             **{k: round(objetivo[k], n) if objetivo and k in objetivo else None
-               for k, n in (("base", 1), ("altura", 1), ("proporcion", 2), ("radio", 1), ("circularidad", 2))},
+               for k, n in (("base", 1), ("altura", 1), ("proporcion", 2), ("radio", 1),
+                            ("circularidad", 2), ("cobertura", 2))},
             "ex": ex,
             "ey": ey,
             "ex_deg": round(error[2], 2) if error else None,
@@ -754,6 +913,12 @@ fieldset:disabled{opacity:.55}
 fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
 .opciones{display:flex;flex-wrap:wrap;gap:8px}
 .opciones button.activa{background:var(--s1);border-color:var(--s1);color:#fff;font-weight:600}
+.campo input[type=color]{height:34px;padding:2px;cursor:pointer}
+#figura{margin:16px 0;padding:12px 16px 16px;border:1px solid var(--border);border-radius:8px}
+#figura[hidden]{display:none}
+#figura h3{font-size:14px;margin:0 0 12px}
+.aviso{color:var(--critical)}
+#video.muestrear{cursor:crosshair}
 #etapas{margin-bottom:16px}
 #control{margin-top:16px}
 .casilla{display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:13px;color:var(--text-2)}
@@ -785,7 +950,7 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
     <section class="card">
       <h2>Video en tiempo real <span class="num" id="tag-res">—</span></h2>
       <img id="video" src="/video" alt="Video de la cámara con el objetivo detectado">
-      <p class="nota">Cruz = centro de la imagen · contorno magenta = objetivo · flecha = error de posición · celeste = píxeles que cuentan como rojo (con la máscara activada)</p>
+      <p class="nota">Cruz = centro de la imagen · contorno magenta = objetivo · flecha = error de posición · celeste = píxeles que cuentan como del color del objetivo (con la máscara activada)</p>
     </section>
     <section class="card">
       <h2>Error de posición vs tiempo <span>últimos 10 s</span></h2>
@@ -864,18 +1029,38 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
 <section class="card" id="ajustes">
   <h2>Calibración <span id="ajustes-estado">solo se puede modificar en la etapa Calibrar</span></h2>
   <label class="casilla"><input type="checkbox" id="ver-mascara">
-    Ver en el video los píxeles que cuentan como rojo y por qué se descarta cada mancha
+    Ver en el video los píxeles que cuentan como del color del objetivo y por qué se descarta cada mancha
     (se puede activar en cualquier etapa)</label>
   <p class="nota" style="margin:0 0 12px">Etiquetas sobre una mancha roja descartada: «relleno» está bajo el relleno mínimo ·
     «rect» ocupa demasiado del rectángulo que la encierra (óvalos y rectángulos, sobre 0,70) ·
     «b/h» es su proporción base/altura, fuera de la tolerancia · «lados» son sus dos lados largos, muy distintos ·
-    «circularidad» está bajo la mínima del láser. Las manchas más chicas que el área mínima no llevan etiqueta.</p>
+    «circularidad» está bajo la mínima del láser · «cobertura» es la parte de la figura envolvente que cubre
+    el color, bajo la mínima · en el cuadrado, «lados» es lado corto/lado largo, muy distinto de 1.
+    Las manchas más chicas que el área mínima no llevan etiqueta.</p>
   <fieldset class="solo-calibrar" disabled>
     <div class="campo"><span>Objetivo a seguir</span>
       <div class="opciones" id="objetivos">
         <button type="button" data-objetivo="triangulo">Figura triangular</button>
         <button type="button" data-objetivo="laser">Círculo del láser</button>
+        <button type="button" data-objetivo="figura">Figura de otro color</button>
       </div></div>
+    <div id="figura" hidden>
+      <h3>Figura de otro color</h3>
+      <div class="campos">
+        <div class="campo"><span>Forma</span>
+          <div class="opciones" id="formas">
+            <button type="button" data-forma="circulo">Círculo</button>
+            <button type="button" data-forma="triangulo">Triángulo</button>
+            <button type="button" data-forma="cuadrado">Cuadrado</button>
+          </div></div>
+        <label class="campo"><span>Color</span>
+          <input type="color" id="figura-color">
+          <small id="figura-hsv">—</small></label>
+      </div>
+      <p class="nota">También se puede tocar el objeto en el video para tomar su color (en la etapa Calibrar).
+        Una mancha del color es el objetivo si cubre al menos la cobertura mínima de la figura más chica
+        de esa forma que la encierra.</p>
+    </div>
     <form id="form-ajustes" class="campos">
       <label class="campo"><span>Triángulo · área mínima (AREA_MIN) [px²]</span>
         <input type="number" id="area-min" min="1" step="1" required>
@@ -901,6 +1086,24 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
       <label class="campo"><span>Triángulo · relleno mínimo (RELLENO_MIN)</span>
         <input type="number" id="relleno-min" min="0.3" max="1" step="0.01" required>
         <small>parte del triángulo envolvente que llena el objetivo · subirlo puede descartar al avión</small></label>
+      <label class="campo"><span>Triángulo · ocupación máxima (OCUPACION_MAX)</span>
+        <input type="number" id="ocupacion-max" min="0.3" max="1" step="0.01" required>
+        <small>parte del rectángulo envolvente · avión cerca ≈ 0,55, lejos (~15 px) hasta ≈ 0,80 · óvalos ≈ 0,79</small></label>
+      <label class="campo"><span>Triángulo · tolerancia de lados (ISOSCELES_TOL)</span>
+        <input type="number" id="isosceles-tol" min="0.01" max="1" step="0.01" required>
+        <small>diferencia aceptada entre los dos lados largos · subirla si el avión se ve chico</small></label>
+      <label class="campo"><span>Figura · tolerancia de tono (FIGURA_TONO_TOL)</span>
+        <input type="number" id="figura-tono-tol" min="1" max="90" step="1" required>
+        <small>el tono va de 0 a 179 · subirlo si el objeto no se pinta entero en la máscara</small></label>
+      <label class="campo"><span>Figura · saturación mínima (FIGURA_SAT_MIN)</span>
+        <input type="number" id="figura-sat-min" min="0" max="255" step="1" required>
+        <small>0 a 255 · no se usa con colores sin tono (blanco, gris, negro)</small></label>
+      <label class="campo"><span>Figura · cobertura mínima (FIGURA_COBERTURA_MIN)</span>
+        <input type="number" id="figura-cobertura-min" min="0.3" max="1" step="0.01" required>
+        <small>un círculo cubre 0,79 de su cuadrado y un cuadrado 0,64 de su círculo</small></label>
+      <label class="campo"><span>Figura · área mínima (FIGURA_AREA_MIN) [px²]</span>
+        <input type="number" id="figura-area-min" min="1" step="1" required>
+        <small>Manchas del color más pequeñas se descartan</small></label>
       <label class="campo"><span>Cámara · compensación de exposición [EV]</span>
         <input type="number" id="exposicion-ev" min="-4" max="4" step="0.25" required>
         <small>positiva aclara: para objetivos a contraluz</small></label>
@@ -1133,10 +1336,13 @@ function dibujarMira() {
 }
 
 // ---------- Paneles numéricos ----------
+let etapaActual = null;
 function pintarEtapa(n) {
+  etapaActual = n;
   for (const b of document.querySelectorAll('#etapas button'))
     b.classList.toggle('activa', Number(b.dataset.etapa) === n);
   const calibrando = n === 2;
+  marcarMuestreo();
   for (const f of document.querySelectorAll('fieldset.solo-calibrar')) f.disabled = !calibrando;
   $('ajustes-estado').textContent = calibrando
     ? 'los cambios se aplican al instante y quedan guardados'
@@ -1174,6 +1380,7 @@ function pintarEstado(d) {
   $('ex-deg').textContent = det ? firmado(d.ex_deg, 2) + '°' : '—';
   $('ey-deg').textContent = det ? firmado(d.ey_deg, 2) + '°' : '—';
   const forma = d.proporcion != null ? ` b/h=${d.proporcion.toFixed(2)}`
+              : d.cobertura != null ? ` cobertura=${d.cobertura.toFixed(2)}`
               : d.radio != null ? ` r=${d.radio.toFixed(0)} px` : '';
   $('pos').textContent = det ? `(${d.x.toFixed(0)}, ${d.y.toFixed(0)})${forma}` : '—';
 
@@ -1260,7 +1467,19 @@ function mostrarAjustes(a) {
   $('sat-min').value = a.sat_min;
   $('brillo-min').value = a.brillo_min;
   $('relleno-min').value = a.relleno_min;
+  $('ocupacion-max').value = a.ocupacion_max;
+  $('isosceles-tol').value = a.isosceles_tol;
   $('exposicion-ev').value = a.exposicion_ev;
+  $('figura-color').value = a.figura_color;
+  $('figura-tono-tol').value = a.figura_tono_tol;
+  $('figura-sat-min').value = a.figura_sat_min;
+  $('figura-cobertura-min').value = a.figura_cobertura_min;
+  $('figura-area-min').value = a.figura_area_min;
+  $('figura').hidden = a.objetivo !== 'figura';
+  for (const b of document.querySelectorAll('#formas button'))
+    b.classList.toggle('activa', b.dataset.forma === a.figura_forma);
+  mostrarHsv();
+  marcarMuestreo();
   $('ver-mascara').checked = a.ver_mascara;
   $('omega-max').value = a.omega_max;
   $('kp-pan').value = a.kp_pan;
@@ -1287,6 +1506,40 @@ async function enviarAjustes(valores, idMsg = 'ajustes-msg') {
   }
 }
 
+// Tono, saturación y brillo del color elegido, y aviso si no pasa los umbrales
+function mostrarHsv() {
+  if (!ajustes) return;
+  const [h, s, v] = ajustes.figura_hsv;
+  const sinTono = s < ajustes.gris_sat_max;
+  let texto = `tono ${h} · sat ${s} · brillo ${v}` + (sinTono ? ' · sin tono: se compara el brillo' : '');
+  let aviso = '';
+  if (!sinTono && s < ajustes.figura_sat_min) aviso = ' · menos saturado que la saturación mínima: no se detectará';
+  else if (!sinTono && v < ajustes.brillo_min) aviso = ' · más oscuro que el brillo mínimo: no se detectará';
+  $('figura-hsv').innerHTML = texto + (aviso ? `<span class="aviso">${aviso}</span>` : '');
+}
+
+// El color se puede tomar tocando el video, en Calibrar y con la figura elegida
+function puedeMuestrear() { return etapaActual === 2 && ajustes && ajustes.objetivo === 'figura'; }
+function marcarMuestreo() { $('video').classList.toggle('muestrear', !!puedeMuestrear()); }
+
+$('video').addEventListener('click', async e => {
+  if (!puedeMuestrear()) return;
+  const r = e.target.getBoundingClientRect();
+  const msg = $('ajustes-msg');
+  try {
+    const resp = await fetch('/muestrear_color', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height})});
+    const d = await resp.json();
+    if (!resp.ok) { msg.textContent = 'Error: ' + d.error; return; }
+    mostrarAjustes(d);
+    msg.textContent = `Color tomado del video: ${d.figura_color}` + (d.aviso ? ' · ' + d.aviso : '');
+  } catch (err) {
+    msg.textContent = 'No se pudo tomar el color: sin conexión con la Raspberry';
+  }
+});
+$('figura-color').addEventListener('change', e => enviarAjustes({figura_color: e.target.value}));
+for (const b of document.querySelectorAll('#formas button'))
+  b.addEventListener('click', () => enviarAjustes({figura_forma: b.dataset.forma}));
 $('prop-tol').addEventListener('input', mostrarRango);
 $('form-ajustes').addEventListener('submit', e => {
   e.preventDefault();
@@ -1294,7 +1547,11 @@ $('form-ajustes').addEventListener('submit', e => {
                  area_min_laser: Number($('area-min-laser').value), circularidad_min: Number($('circ-min').value),
                  tono_max: Number($('tono-max').value), sat_min: Number($('sat-min').value),
                  brillo_min: Number($('brillo-min').value), relleno_min: Number($('relleno-min').value),
-                 exposicion_ev: Number($('exposicion-ev').value)});
+                 ocupacion_max: Number($('ocupacion-max').value), isosceles_tol: Number($('isosceles-tol').value),
+                 exposicion_ev: Number($('exposicion-ev').value),
+                 figura_tono_tol: Number($('figura-tono-tol').value), figura_sat_min: Number($('figura-sat-min').value),
+                 figura_cobertura_min: Number($('figura-cobertura-min').value),
+                 figura_area_min: Number($('figura-area-min').value)});
 });
 $('ver-mascara').addEventListener('change', e => enviarAjustes({ver_mascara: e.target.checked}));
 for (const b of document.querySelectorAll('#objetivos button'))
@@ -1377,7 +1634,13 @@ AJUSTES_NUMERICOS = {
     "sat_min": (0, 255, 0),
     "brillo_min": (0, 255, 0),
     "relleno_min": (0.3, 1, 3),
+    "ocupacion_max": (0.3, 1, 3),
+    "isosceles_tol": (0.01, 1, 3),
     "exposicion_ev": (-4, 4, 2),
+    "figura_tono_tol": (1, 90, 0),
+    "figura_sat_min": (0, 255, 0),
+    "figura_cobertura_min": (0.3, 1, 3),
+    "figura_area_min": (1, ANCHO * ALTO, 0),
     "omega_max": (0.1, 10, 3),
     "kp_pan": (0, 50, 3),
     "ki_pan": (0, 50, 3),
@@ -1393,6 +1656,10 @@ def ajustes_actuales():
             "area_min_laser": AREA_MIN_LASER, "circularidad_min": CIRCULARIDAD_MIN,
             "tono_max": TONO_MAX, "sat_min": SAT_MIN, "brillo_min": BRILLO_MIN,
             "relleno_min": RELLENO_MIN, "exposicion_ev": EXPOSICION_EV, "ver_mascara": VER_MASCARA,
+            "ocupacion_max": OCUPACION_MAX, "isosceles_tol": ISOSCELES_TOL,
+            "figura_forma": FIGURA_FORMA, "figura_color": FIGURA_COLOR, "figura_tono_tol": FIGURA_TONO_TOL,
+            "figura_sat_min": FIGURA_SAT_MIN, "figura_cobertura_min": FIGURA_COBERTURA_MIN,
+            "figura_area_min": FIGURA_AREA_MIN,
             "omega_max": OMEGA_MAX, "kp_pan": KP_PAN, "ki_pan": KI_PAN,
             "kp_tilt": KP_TILT, "ki_tilt": KI_TILT}
 
@@ -1408,7 +1675,12 @@ def validar_ajustes(datos):
     a = {**ajustes_actuales(), **{k: v for k, v in datos.items() if k in AJUSTES_DEFECTO}}
 
     if a["objetivo"] not in OBJETIVOS:
-        raise ValueError('objetivo debe ser "triangulo" o "laser"')
+        raise ValueError('objetivo debe ser "triangulo", "laser" o "figura"')
+    if a["figura_forma"] not in FORMAS:
+        raise ValueError('figura_forma debe ser "circulo", "triangulo" o "cuadrado"')
+    if not (isinstance(a["figura_color"], str) and re.fullmatch(r"#[0-9a-fA-F]{6}", a["figura_color"])):
+        raise ValueError('figura_color debe ser un color "#rrggbb"')
+    a["figura_color"] = a["figura_color"].lower()
     if not isinstance(a["ver_mascara"], bool):
         raise ValueError("ver_mascara debe ser true o false")
     for k, (minimo, maximo, decimales) in AJUSTES_NUMERICOS.items():
@@ -1426,9 +1698,15 @@ def aplicar_ajustes(datos, guardar):
     global OBJETIVO, AREA_MIN, PROPORCION_TOL, AREA_MIN_LASER, CIRCULARIDAD_MIN
     global OMEGA_MAX, KP_PAN, KI_PAN, KP_TILT, KI_TILT
     global TONO_MAX, SAT_MIN, BRILLO_MIN, RELLENO_MIN, EXPOSICION_EV, VER_MASCARA
+    global OCUPACION_MAX, ISOSCELES_TOL
+    global FIGURA_FORMA, FIGURA_COLOR, FIGURA_TONO_TOL, FIGURA_SAT_MIN, FIGURA_COBERTURA_MIN, FIGURA_AREA_MIN
     a = validar_ajustes(datos)
+    FIGURA_FORMA, FIGURA_COLOR, FIGURA_TONO_TOL = a["figura_forma"], a["figura_color"], a["figura_tono_tol"]
+    FIGURA_SAT_MIN, FIGURA_COBERTURA_MIN = a["figura_sat_min"], a["figura_cobertura_min"]
+    FIGURA_AREA_MIN = a["figura_area_min"]
     TONO_MAX, SAT_MIN, BRILLO_MIN = a["tono_max"], a["sat_min"], a["brillo_min"]
     RELLENO_MIN, EXPOSICION_EV, VER_MASCARA = a["relleno_min"], a["exposicion_ev"], a["ver_mascara"]
+    OCUPACION_MAX, ISOSCELES_TOL = a["ocupacion_max"], a["isosceles_tol"]
     OBJETIVO, AREA_MIN, PROPORCION_TOL = a["objetivo"], a["area_min"], a["proporcion_tol"]
     AREA_MIN_LASER, CIRCULARIDAD_MIN = a["area_min_laser"], a["circularidad_min"]
     OMEGA_MAX, KP_PAN, KI_PAN, KP_TILT, KI_TILT = (a[k] for k in AJUSTES_CONTROL)
@@ -1470,7 +1748,53 @@ def ajustes():
             return jsonify(error=str(e)), 400
         except OSError as e:
             return jsonify(error=f"se aplicó, pero no se pudo guardar ({e})"), 500
-    return jsonify(**ajustes_actuales(), proporcion=round(PROPORCION, 4), defecto=AJUSTES_DEFECTO)
+    return respuesta_ajustes()
+
+
+def respuesta_ajustes(**extra):
+    return jsonify(**ajustes_actuales(), proporcion=round(PROPORCION, 4), defecto=AJUSTES_DEFECTO,
+                   figura_hsv=color_hsv(FIGURA_COLOR), gris_sat_max=GRIS_SAT_MAX, **extra)
+
+
+@app.route("/muestrear_color", methods=["POST"])
+def muestrear_color():
+    """
+    POST {"x": 0..1, "y": 0..1}: toma como color de la figura el del último cuadro en ese
+    punto (fracción del ancho y del alto), con la mediana de un cuadrado de 11 x 11 px.
+    Solo en la etapa Calibrar. Si el color es menos saturado que FIGURA_SAT_MIN, la baja.
+    """
+    datos = request.get_json(silent=True) or {}
+    try:
+        fx, fy = float(datos["x"]), float(datos["y"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify(error="se esperaba la posición x, y como fracción de la imagen"), 400
+    if not (0 <= fx <= 1 and 0 <= fy <= 1):
+        return jsonify(error="la posición debe estar dentro de la imagen"), 400
+
+    frame = ultimo_frame
+    if frame is None:
+        return jsonify(error="todavía no hay imagen de la cámara"), 503
+    alto, ancho = frame.shape[:2]
+    x, y = min(int(fx * ancho), ancho - 1), min(int(fy * alto), alto - 1)
+    parche = frame[max(y - 5, 0):y + 6, max(x - 5, 0):x + 6].reshape(-1, 3)
+    b, g, r = (int(v) for v in np.median(parche, axis=0))
+    color = f"#{r:02x}{g:02x}{b:02x}"
+
+    cambios = {"figura_color": color}
+    aviso = ""
+    _, s, _ = color_hsv(color)
+    if GRIS_SAT_MAX <= s and s * 0.7 < FIGURA_SAT_MIN:
+        cambios["figura_sat_min"] = max(GRIS_SAT_MAX, round(s * 0.7))
+        aviso = f"saturación mínima bajada a {cambios['figura_sat_min']}"
+    try:
+        with lock:
+            if etapa != CALIBRAR:
+                return jsonify(error="el color solo se puede tomar en la etapa Calibrar"), 409
+            aplicar_ajustes(cambios, guardar=True)
+    except OSError as e:
+        return jsonify(error=f"se aplicó, pero no se pudo guardar ({e})"), 500
+    print(f"Color de la figura tomado del video en ({x}, {y}): {color} (HSV {color_hsv(color)})")
+    return respuesta_ajustes(aviso=aviso)
 
 
 if __name__ == "__main__":
