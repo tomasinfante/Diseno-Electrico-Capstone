@@ -108,14 +108,14 @@ static const ConfigEncoderAs5600 CONFIG_ENCODER_TILT = {
 static const ConfigKalman CONFIG_KALMAN_PAN = {
     .ts = TS,
     .sigmaMedicion = 0.004f,    // ~2 px de ruido en la detección (1 px ≈ 0.0019 rad)
-    .sigmaAceleracion = 0.5f,
+    .sigmaAceleracion = 0.1f,
     .sigmaOmegaInicial = 0.5f,
 };
 
 static const ConfigKalman CONFIG_KALMAN_TILT = {
     .ts = TS,
     .sigmaMedicion = 0.004f,
-    .sigmaAceleracion = 0.5f,
+    .sigmaAceleracion = 0.1f,
     .sigmaOmegaInicial = 0.5f,
 };
 
