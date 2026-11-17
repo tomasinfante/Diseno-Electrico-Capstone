@@ -36,7 +36,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import serial
+#import serial
 from flask import Flask, Response, jsonify, request
 
 # ---------------- Parámetros ----------------
@@ -914,9 +914,11 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
 .opciones{display:flex;flex-wrap:wrap;gap:8px}
 .opciones button.activa{background:var(--s1);border-color:var(--s1);color:#fff;font-weight:600}
 .campo input[type=color]{height:34px;padding:2px;cursor:pointer}
-#figura{margin:16px 0;padding:12px 16px 16px;border:1px solid var(--border);border-radius:8px}
-#figura[hidden]{display:none}
-#figura h3{font-size:14px;margin:0 0 12px}
+.grupo{margin:16px 0;padding:12px 16px 16px;border:1px solid var(--border);border-radius:8px}
+.grupo[hidden]{display:none}
+.grupo h3{font-size:14px;margin:0 0 12px}
+.grupo .nota{margin:12px 0 0}
+.grupo .campos + .campos{margin-top:12px}
 .aviso{color:var(--critical)}
 #video.muestrear{cursor:crosshair}
 #etapas{margin-bottom:16px}
@@ -1031,12 +1033,6 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
   <label class="casilla"><input type="checkbox" id="ver-mascara">
     Ver en el video los píxeles que cuentan como del color del objetivo y por qué se descarta cada mancha
     (se puede activar en cualquier etapa)</label>
-  <p class="nota" style="margin:0 0 12px">Etiquetas sobre una mancha roja descartada: «relleno» está bajo el relleno mínimo ·
-    «rect» ocupa demasiado del rectángulo que la encierra (óvalos y rectángulos, sobre 0,70) ·
-    «b/h» es su proporción base/altura, fuera de la tolerancia · «lados» son sus dos lados largos, muy distintos ·
-    «circularidad» está bajo la mínima del láser · «cobertura» es la parte de la figura envolvente que cubre
-    el color, bajo la mínima · en el cuadrado, «lados» es lado corto/lado largo, muy distinto de 1.
-    Las manchas más chicas que el área mínima no llevan etiqueta.</p>
   <fieldset class="solo-calibrar" disabled>
     <div class="campo"><span>Objetivo a seguir</span>
       <div class="opciones" id="objetivos">
@@ -1044,69 +1040,105 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
         <button type="button" data-objetivo="laser">Círculo del láser</button>
         <button type="button" data-objetivo="figura">Figura de otro color</button>
       </div></div>
-    <div id="figura" hidden>
-      <h3>Figura de otro color</h3>
-      <div class="campos">
-        <div class="campo"><span>Forma</span>
-          <div class="opciones" id="formas">
-            <button type="button" data-forma="circulo">Círculo</button>
-            <button type="button" data-forma="triangulo">Triángulo</button>
-            <button type="button" data-forma="cuadrado">Cuadrado</button>
-          </div></div>
-        <label class="campo"><span>Color</span>
-          <input type="color" id="figura-color">
-          <small id="figura-hsv">—</small></label>
+    <p class="nota">Solo se muestran los parámetros del objetivo elegido.</p>
+
+    <form id="form-ajustes">
+      <div class="grupo" data-objetivos="triangulo">
+        <h3>Figura triangular (avión)</h3>
+        <div class="campos">
+          <label class="campo"><span>Área mínima (AREA_MIN) [px²]</span>
+            <input type="number" id="area-min" min="1" step="1" required>
+            <small>Manchas rojas más pequeñas se descartan</small></label>
+          <label class="campo"><span>Tolerancia de proporción (PROPORCION_TOL)</span>
+            <input type="number" id="prop-tol" min="0.01" max="1" step="0.01" required>
+            <small id="rango-prop">—</small></label>
+          <label class="campo"><span>Relleno mínimo (RELLENO_MIN)</span>
+            <input type="number" id="relleno-min" min="0.3" max="1" step="0.01" required>
+            <small>parte del triángulo envolvente que llena el objetivo · subirlo puede descartar al avión</small></label>
+          <label class="campo"><span>Ocupación máxima (OCUPACION_MAX)</span>
+            <input type="number" id="ocupacion-max" min="0.3" max="1" step="0.01" required>
+            <small>parte del rectángulo envolvente · avión cerca ≈ 0,55, lejos (~15 px) hasta ≈ 0,80 · óvalos ≈ 0,79</small></label>
+          <label class="campo"><span>Tolerancia de lados (ISOSCELES_TOL)</span>
+            <input type="number" id="isosceles-tol" min="0.01" max="1" step="0.01" required>
+            <small>diferencia aceptada entre los dos lados largos · subirla si el avión se ve chico</small></label>
+        </div>
+        <p class="nota">Etiquetas sobre una mancha roja descartada: «relleno» está bajo el relleno mínimo ·
+          «rect» ocupa más que la ocupación máxima de su rectángulo (óvalos y rectángulos) ·
+          «b/h» es su proporción base/altura, fuera de la tolerancia · «lados» son sus dos lados largos, muy distintos.
+          Las manchas más chicas que el área mínima no llevan etiqueta.</p>
       </div>
-      <p class="nota">También se puede tocar el objeto en el video para tomar su color (en la etapa Calibrar).
-        Una mancha del color es el objetivo si cubre al menos la cobertura mínima de la figura más chica
-        de esa forma que la encierra.</p>
-    </div>
-    <form id="form-ajustes" class="campos">
-      <label class="campo"><span>Triángulo · área mínima (AREA_MIN) [px²]</span>
-        <input type="number" id="area-min" min="1" step="1" required>
-        <small>Manchas rojas más pequeñas se descartan</small></label>
-      <label class="campo"><span>Triángulo · tolerancia de proporción (PROPORCION_TOL)</span>
-        <input type="number" id="prop-tol" min="0.01" max="1" step="0.01" required>
-        <small id="rango-prop">—</small></label>
-      <label class="campo"><span>Láser · área mínima (AREA_MIN_LASER) [px²]</span>
-        <input type="number" id="area-min-laser" min="1" step="1" required>
-        <small>Manchas rojas más pequeñas se descartan</small></label>
-      <label class="campo"><span>Láser · circularidad mínima (CIRCULARIDAD_MIN)</span>
-        <input type="number" id="circ-min" min="0.01" max="1" step="0.01" required>
-        <small>1 = círculo perfecto</small></label>
-      <label class="campo"><span>Rojo · tono máximo (TONO_MAX)</span>
-        <input type="number" id="tono-max" min="0" max="15" step="1" required>
-        <small>0 a 15 · sobre ~7 empieza a entrar la piel</small></label>
-      <label class="campo"><span>Rojo · saturación mínima (SAT_MIN)</span>
-        <input type="number" id="sat-min" min="0" max="255" step="1" required>
-        <small>0 a 255 · avión ≈ 200, labios y piel hasta ≈ 157 · los bordes aceptan hasta 50 menos</small></label>
-      <label class="campo"><span>Rojo · brillo mínimo (BRILLO_MIN)</span>
-        <input type="number" id="brillo-min" min="0" max="255" step="1" required>
-        <small>0 a 255 · bajarlo si el objetivo está a contraluz</small></label>
-      <label class="campo"><span>Triángulo · relleno mínimo (RELLENO_MIN)</span>
-        <input type="number" id="relleno-min" min="0.3" max="1" step="0.01" required>
-        <small>parte del triángulo envolvente que llena el objetivo · subirlo puede descartar al avión</small></label>
-      <label class="campo"><span>Triángulo · ocupación máxima (OCUPACION_MAX)</span>
-        <input type="number" id="ocupacion-max" min="0.3" max="1" step="0.01" required>
-        <small>parte del rectángulo envolvente · avión cerca ≈ 0,55, lejos (~15 px) hasta ≈ 0,80 · óvalos ≈ 0,79</small></label>
-      <label class="campo"><span>Triángulo · tolerancia de lados (ISOSCELES_TOL)</span>
-        <input type="number" id="isosceles-tol" min="0.01" max="1" step="0.01" required>
-        <small>diferencia aceptada entre los dos lados largos · subirla si el avión se ve chico</small></label>
-      <label class="campo"><span>Figura · tolerancia de tono (FIGURA_TONO_TOL)</span>
-        <input type="number" id="figura-tono-tol" min="1" max="90" step="1" required>
-        <small>el tono va de 0 a 179 · subirlo si el objeto no se pinta entero en la máscara</small></label>
-      <label class="campo"><span>Figura · saturación mínima (FIGURA_SAT_MIN)</span>
-        <input type="number" id="figura-sat-min" min="0" max="255" step="1" required>
-        <small>0 a 255 · no se usa con colores sin tono (blanco, gris, negro)</small></label>
-      <label class="campo"><span>Figura · cobertura mínima (FIGURA_COBERTURA_MIN)</span>
-        <input type="number" id="figura-cobertura-min" min="0.3" max="1" step="0.01" required>
-        <small>un círculo cubre 0,79 de su cuadrado y un cuadrado 0,64 de su círculo</small></label>
-      <label class="campo"><span>Figura · área mínima (FIGURA_AREA_MIN) [px²]</span>
-        <input type="number" id="figura-area-min" min="1" step="1" required>
-        <small>Manchas del color más pequeñas se descartan</small></label>
-      <label class="campo"><span>Cámara · compensación de exposición [EV]</span>
-        <input type="number" id="exposicion-ev" min="-4" max="4" step="0.25" required>
-        <small>positiva aclara: para objetivos a contraluz</small></label>
+
+      <div class="grupo" data-objetivos="laser">
+        <h3>Círculo del láser</h3>
+        <div class="campos">
+          <label class="campo"><span>Área mínima (AREA_MIN_LASER) [px²]</span>
+            <input type="number" id="area-min-laser" min="1" step="1" required>
+            <small>Manchas rojas más pequeñas se descartan</small></label>
+          <label class="campo"><span>Circularidad mínima (CIRCULARIDAD_MIN)</span>
+            <input type="number" id="circ-min" min="0.01" max="1" step="0.01" required>
+            <small>1 = círculo perfecto</small></label>
+        </div>
+        <p class="nota">Etiqueta sobre una mancha roja descartada: «circularidad» está bajo la mínima.</p>
+      </div>
+
+      <div class="grupo" data-objetivos="triangulo laser">
+        <h3>Color rojo</h3>
+        <div class="campos">
+          <label class="campo"><span>Tono máximo (TONO_MAX)</span>
+            <input type="number" id="tono-max" min="0" max="15" step="1" required>
+            <small>0 a 15 · sobre ~7 empieza a entrar la piel</small></label>
+          <label class="campo"><span>Saturación mínima (SAT_MIN)</span>
+            <input type="number" id="sat-min" min="0" max="255" step="1" required>
+            <small>0 a 255 · avión ≈ 200, labios y piel hasta ≈ 157 · los bordes aceptan hasta 50 menos</small></label>
+        </div>
+      </div>
+
+      <div class="grupo" data-objetivos="figura">
+        <h3>Figura de otro color</h3>
+        <div class="campos">
+          <div class="campo"><span>Forma</span>
+            <div class="opciones" id="formas">
+              <button type="button" data-forma="circulo">Círculo</button>
+              <button type="button" data-forma="triangulo">Triángulo</button>
+              <button type="button" data-forma="cuadrado">Cuadrado</button>
+            </div></div>
+          <label class="campo"><span>Color</span>
+            <input type="color" id="figura-color">
+            <small id="figura-hsv">—</small></label>
+        </div>
+        <p class="nota">También se puede tocar el objeto en el video para tomar su color.
+          Una mancha del color es el objetivo si cubre al menos la cobertura mínima de la figura más chica
+          de esa forma que la encierra.</p>
+        <div class="campos">
+          <label class="campo"><span>Tolerancia de tono (FIGURA_TONO_TOL)</span>
+            <input type="number" id="figura-tono-tol" min="1" max="90" step="1" required>
+            <small>el tono va de 0 a 179 · subirlo si el objeto no se pinta entero en la máscara</small></label>
+          <label class="campo"><span>Saturación mínima (FIGURA_SAT_MIN)</span>
+            <input type="number" id="figura-sat-min" min="0" max="255" step="1" required>
+            <small>0 a 255 · no se usa con colores sin tono (blanco, gris, negro)</small></label>
+          <label class="campo"><span>Cobertura mínima (FIGURA_COBERTURA_MIN)</span>
+            <input type="number" id="figura-cobertura-min" min="0.3" max="1" step="0.01" required>
+            <small>un círculo cubre 0,79 de su cuadrado y un cuadrado 0,64 de su círculo</small></label>
+          <label class="campo"><span>Área mínima (FIGURA_AREA_MIN) [px²]</span>
+            <input type="number" id="figura-area-min" min="1" step="1" required>
+            <small>Manchas del color más pequeñas se descartan</small></label>
+        </div>
+        <p class="nota">Etiquetas sobre una mancha descartada: «cobertura» es la parte de la figura envolvente
+          que cubre el color, bajo la mínima · en el cuadrado, «lados» es lado corto/lado largo, muy distinto de 1.</p>
+      </div>
+
+      <div class="grupo">
+        <h3>Cámara y brillo (todos los objetivos)</h3>
+        <div class="campos">
+          <label class="campo"><span>Brillo mínimo (BRILLO_MIN)</span>
+            <input type="number" id="brillo-min" min="0" max="255" step="1" required>
+            <small>0 a 255 · bajarlo si el objetivo está a contraluz · no se usa con colores sin tono</small></label>
+          <label class="campo"><span>Compensación de exposición [EV]</span>
+            <input type="number" id="exposicion-ev" min="-4" max="4" step="0.25" required>
+            <small>positiva aclara: para objetivos a contraluz</small></label>
+        </div>
+      </div>
+
       <div class="botones">
         <button type="submit" class="principal">Guardar</button>
         <button type="button" id="restablecer">Valores por defecto</button>
@@ -1475,7 +1507,9 @@ function mostrarAjustes(a) {
   $('figura-sat-min').value = a.figura_sat_min;
   $('figura-cobertura-min').value = a.figura_cobertura_min;
   $('figura-area-min').value = a.figura_area_min;
-  $('figura').hidden = a.objetivo !== 'figura';
+  // Solo los grupos de parámetros del objetivo elegido (los sin data-objetivos son de todos)
+  for (const g of document.querySelectorAll('#form-ajustes .grupo[data-objetivos]'))
+    g.hidden = !g.dataset.objetivos.split(' ').includes(a.objetivo);
   for (const b of document.querySelectorAll('#formas button'))
     b.classList.toggle('activa', b.dataset.forma === a.figura_forma);
   mostrarHsv();
