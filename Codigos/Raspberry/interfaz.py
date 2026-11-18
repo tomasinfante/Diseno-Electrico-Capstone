@@ -36,7 +36,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-#import serial
+import serial
 from flask import Flask, Response, jsonify, request
 
 # ---------------- Parámetros ----------------
@@ -104,6 +104,22 @@ NUCLEO_ALTO = np.array([179, 80, 255])
 AREA_MIN_LASER = 1       # px^2, descarta ruido
 CIRCULARIDAD_MIN = 0.6   # 1.0 = círculo perfecto
 
+# Seguimiento por silueta: a contraluz el color puede perderse aunque el objetivo siga ahí,
+# visto como una mancha más oscura que su entorno. Mientras se sigue un objetivo (nunca para
+# encontrarlo por primera vez), si en un cuadro no aparece por color se busca una mancha
+# oscura de la misma forma cerca de su última posición. Solo para el avión y la figura.
+SILUETA_ACTIVA = True
+SILUETA_CONTRASTE = 50   # cuánto más oscura que el promedio de su entorno debe ser (0 a 255)
+SILUETA_ENTORNO = 41     # px; lado de la ventana con que se promedia el entorno
+SILUETA_MAX_S = 2.0      # s; tiempo máximo siguiendo solo por forma sin ver el color
+# Mientras se lo ve por color se mide también su silueta (cada SILUETA_REF_S), que suele ser más
+# grande que la mancha de color: sin color, la silueta debe tener un área entre 1/RAZON y RAZON
+# veces esa referencia y estar cerca, a menos de SILUETA_PUERTA veces su tamaño (√área)
+SILUETA_REF_S = 0.2
+SILUETA_AREA_RAZON = 2.0
+SILUETA_PUERTA = 3.0
+SILUETA_PUERTA_MIN = 20  # px
+
 # Continuidad entre cuadros: evita saltar a otra cosa y las detecciones de un solo cuadro
 FRAMES_CONFIRMAR = 3    # cuadros seguidos en que debe verse un objetivo nuevo antes de aceptarlo
 MEMORIA_S = 0.3         # s; si el objetivo desaparece, durante este tiempo no se acepta otro lejos de él
@@ -168,7 +184,7 @@ id_video = 0                               # cuenta los JPEG publicados
 id_frame = 0                               # cuenta los cuadros procesados (detección)
 info_video = {"jpg_kb": 0.0, "fps_video": 0.0, "video_ms": 0.0}
 hay_cuadro = threading.Condition()         # la detección dejó un cuadro para el hilo del video
-cuadro_video = None                        # (frame, objetivo, error, fps, mascara, descartes)
+cuadro_video = None                        # (frame, objetivo, error, fps, mascara, descartes, puertas)
 ultimo_frame = None                        # último cuadro de la cámara, sin dibujar (para tomar colores)
 estado = None
 historial = deque(maxlen=HISTORIAL_MAX)  # [id, t, detectado, ex, ey, fps]
@@ -246,8 +262,8 @@ class CamaraPi:
 
 # ---------------- Visión ----------------
 def tono_rojo(hsv, sat_min):
-    return (cv2.inRange(hsv, (0, sat_min, BRILLO_MIN), (TONO_MAX, 255, 255))
-            | cv2.inRange(hsv, (TONO_ROJO_MIN, sat_min, BRILLO_MIN), (179, 255, 255)))
+    return cv2.bitwise_or(cv2.inRange(hsv, (0, sat_min, BRILLO_MIN), (TONO_MAX, 255, 255)),
+                          cv2.inRange(hsv, (TONO_ROJO_MIN, sat_min, BRILLO_MIN), (179, 255, 255)))
 
 
 def mascara_roja(hsv):
@@ -264,15 +280,18 @@ def mascara_roja(hsv):
     if w == 0:
         return debil
     zona = debil[y:y + h, x:x + w]
+    # El área de cada mancha sale de OpenCV (contarla con numpy sobre toda la zona era lo más lento)
+    n, etiquetas, stats, _ = cv2.connectedComponentsWithStats(zona, connectivity=8)
     fuerte = (hsv[y:y + h, x:x + w, 1] >= SAT_MIN) & (zona > 0)
-
-    n, etiquetas = cv2.connectedComponents(zona)
-    total = np.bincount(etiquetas.ravel(), minlength=n)
     nucleo = np.bincount(etiquetas[fuerte], minlength=n)
-    vale = nucleo >= NUCLEO_FRAC * total
-    vale[0] = False  # la etiqueta 0 es el fondo
-    if not vale.all():
-        zona[~vale[etiquetas]] = 0
+    vale = nucleo >= NUCLEO_FRAC * stats[:, cv2.CC_STAT_AREA]
+
+    # Se borran solo las manchas que no valen, cada una dentro de su propio rectángulo
+    # (la etiqueta 0 es el fondo)
+    for e in np.flatnonzero(~vale[1:]) + 1:
+        ex, ey, ew, eh = stats[e, :4]
+        sub = zona[ey:ey + eh, ex:ex + ew]
+        sub[etiquetas[ey:ey + eh, ex:ex + ew] == e] = 0
     return debil
 
 
@@ -534,14 +553,51 @@ def detectar_figura(color, descartes):
     return candidatos
 
 
+def desplazar(candidato, dx, dy):
+    """Mueve un candidato detectado en un recorte a las coordenadas de la imagen completa."""
+    candidato["x"] += dx
+    candidato["y"] += dy
+    for k in ("poligono", "punta"):
+        if k in candidato:
+            candidato[k] = candidato[k] + np.array([dx, dy], np.float32)
+    return candidato
+
+
+def detectar_silueta(frame_bgr, centro, radio):
+    """
+    Candidatos a objetivo por su forma, sin mirar el color: manchas al menos SILUETA_CONTRASTE
+    más oscuras que el promedio de su entorno, con la forma del objetivo elegido. Solo se busca
+    en un cuadrado de lado 2·radio alrededor de `centro` (x, y), que es la puerta del seguidor.
+    """
+    alto, ancho = frame_bgr.shape[:2]
+    r = int(radio) + SILUETA_ENTORNO // 2 + 1  # margen para promediar el entorno en el borde
+    x0, y0 = max(int(centro[0]) - r, 0), max(int(centro[1]) - r, 0)
+    x1, y1 = min(int(centro[0]) + r + 1, ancho), min(int(centro[1]) + r + 1, alto)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return []
+
+    b, g, r = cv2.split(cv2.GaussianBlur(frame_bgr[y0:y1, x0:x1], (5, 5), 0))
+    brillo = cv2.max(cv2.max(b, g), r)  # el brillo (V) de HSV es el máximo de B, G y R
+    entorno = cv2.blur(brillo, (SILUETA_ENTORNO, SILUETA_ENTORNO))
+    # entorno - brillo, sin pasar bajo 0
+    oscura = cv2.threshold(cv2.subtract(entorno, brillo), SILUETA_CONTRASTE - 1, 255, cv2.THRESH_BINARY)[1]
+
+    candidatos = detectar_figura(oscura, []) if OBJETIVO == "figura" else detectar_triangulo(oscura, [])
+    return [desplazar(c, x0, y0) for c in candidatos]
+
+
 class SeguidorObjetivo:
     """
     Decide cuál de los candidatos de cada cuadro es el objetivo, usando lo visto antes:
       - Un objetivo nuevo solo se acepta tras verlo FRAMES_CONFIRMAR cuadros seguidos en
         (casi) el mismo lugar: una detección falsa de un solo cuadro no cuenta.
       - Mientras se sigue un objetivo solo se acepta el candidato más cercano a su última
-        posición, dentro de una distancia máxima ("puerta"): no se salta a otra cosa aunque
-        sea más grande. Si desaparece, se lo espera MEMORIA_S antes de buscar uno nuevo.
+        posición, dentro de una caja centrada en ella ("puerta", de lado 2·radio): no se salta
+        a otra cosa aunque sea más grande. La caja se dibuja en el video. Si desaparece, se lo espera MEMORIA_S antes de buscar uno nuevo.
+      - Si mientras se lo sigue no aparece por color, se lo busca por su silueta (ver
+        detectar_silueta) muy cerca de su última posición y con un área parecida a la de su
+        silueta medida mientras se lo veía por color. Así se lo sigue a lo más SILUETA_MAX_S
+        sin ver el color; después se lo da por perdido.
     """
 
     def __init__(self):
@@ -552,22 +608,68 @@ class SeguidorObjetivo:
         self.t = 0.0           # instante de esa posición
         self.pendiente = None  # posición del candidato que se está confirmando
         self.cuenta = 0        # cuadros seguidos en que se vio
+        self.t_color = 0.0     # último instante en que se lo vio por color
+        self.area_sil = None   # área de su silueta, medida mientras se lo ve por color
+        self.t_ref = -1e9      # instante de esa medición
+        self.puertas = []      # cajas usadas en el último cuadro: (tipo, (x, y), radio), para dibujarlas
 
     @staticmethod
     def _distancia(candidato, pos):
         return float(np.hypot(candidato["x"] - pos[0], candidato["y"] - pos[1]))
 
-    def elegir(self, candidatos, t, ancho):
-        """Devuelve el candidato que es el objetivo en el instante t [s], o None."""
+    @staticmethod
+    def _en_caja(candidato, pos, radio):
+        """True si el candidato está dentro de la caja de lado 2·radio centrada en pos."""
+        return abs(candidato["x"] - pos[0]) <= radio and abs(candidato["y"] - pos[1]) <= radio
+
+    def _medir_silueta(self, silueta, elegido, t):
+        """Mide (cada SILUETA_REF_S) el área de la silueta del objetivo visto por color."""
+        if silueta is None or t - self.t_ref < SILUETA_REF_S:
+            return
+        self.t_ref = t
+        radio = max(3 * np.sqrt(elegido["area"]), SILUETA_PUERTA_MIN)
+        propias = [c for c in silueta((elegido["x"], elegido["y"]), radio)
+                   if self._distancia(c, self.pos) <= max(np.sqrt(elegido["area"]), 6)]
+        if propias:
+            self.area_sil = min(propias, key=lambda c: self._distancia(c, self.pos))["area"]
+
+    def _seguir_silueta(self, silueta, t):
+        """Sin color: la silueta más cercana, con un tamaño parecido y por un tiempo limitado."""
+        if silueta is None or self.area_sil is None or t - self.t_color > SILUETA_MAX_S:
+            return None
+        # Puerta proporcional al tamaño del objetivo, algo mayor si se perdió algún cuadro
+        radio = max(SILUETA_PUERTA * np.sqrt(self.area_sil), SILUETA_PUERTA_MIN)
+        radio *= min(1 + (t - self.t) / 0.1, 3)
+        self.puertas.append(("silueta", self.pos, radio))
+        cerca = [c for c in silueta(self.pos, radio)
+                 if self._en_caja(c, self.pos, radio)
+                 and 1 / SILUETA_AREA_RAZON <= c["area"] / self.area_sil <= SILUETA_AREA_RAZON]
+        if not cerca:
+            return None
+        elegido = min(cerca, key=lambda c: self._distancia(c, self.pos))
+        self.pos, self.t = (elegido["x"], elegido["y"]), t
+        elegido["por_silueta"] = True
+        return elegido
+
+    def elegir(self, candidatos, t, ancho, silueta=None):
+        """
+        Devuelve el candidato que es el objetivo en el instante t [s], o None.
+        silueta(centro, radio): si se entrega, busca candidatos por forma alrededor de centro;
+        se usa solo mientras se sigue un objetivo y no aparece por color.
+        """
+        self.puertas = []
         if self.pos is not None and t - self.t <= MEMORIA_S:
             # La puerta crece con el tiempo sin verlo: pudo moverse más
             puerta = ancho * (PUERTA_BASE + PUERTA_POR_S * (t - self.t))
-            cerca = [c for c in candidatos if self._distancia(c, self.pos) <= puerta]
-            if not cerca:
-                return None
-            elegido = min(cerca, key=lambda c: self._distancia(c, self.pos))
-            self.pos, self.t = (elegido["x"], elegido["y"]), t
-            return elegido
+            self.puertas.append(("color", self.pos, puerta))
+            cerca = [c for c in candidatos if self._en_caja(c, self.pos, puerta)]
+            if cerca:
+                elegido = min(cerca, key=lambda c: self._distancia(c, self.pos))
+                self.pos, self.t, self.t_color = (elegido["x"], elegido["y"]), t, t
+                self._medir_silueta(silueta, elegido, t)
+                elegido["por_silueta"] = False
+                return elegido
+            return self._seguir_silueta(silueta, t)
 
         # No se sigue a nadie: confirmar al candidato más grande
         self.pos = None
@@ -580,8 +682,11 @@ class SeguidorObjetivo:
         self.pendiente = (mayor["x"], mayor["y"])
         if self.cuenta < FRAMES_CONFIRMAR:
             return None
-        self.pos, self.t = self.pendiente, t
+        self.pos, self.t, self.t_color = self.pendiente, t, t
+        self.area_sil, self.t_ref = None, -1e9  # objetivo nuevo: medir su silueta de nuevo
+        self._medir_silueta(silueta, mayor, t)
         self.pendiente, self.cuenta = None, 0
+        mayor["por_silueta"] = False
         return mayor
 
 
@@ -611,7 +716,7 @@ def etiqueta(frame, texto, x, y, escala, grosor):
     cv2.putText(frame, texto, (x + m, y + m + th), FUENTE, escala, (255, 255, 255), grosor, cv2.LINE_AA)
 
 
-def dibujar(frame, objetivo, error, fps, mascara=None, descartes=()):
+def dibujar(frame, objetivo, error, fps, mascara=None, descartes=(), puertas=()):
     alto, ancho = frame.shape[:2]
     cx, cy = ancho // 2, alto // 2
     g = max(1, round(ancho / 640))  # grosor proporcional a la resolución
@@ -626,26 +731,43 @@ def dibujar(frame, objetivo, error, fps, mascara=None, descartes=()):
 
     cv2.drawMarker(frame, (cx, cy), (220, 220, 220), cv2.MARKER_CROSS, 24 * g, g)
 
+    # Puertas del seguidor: solo los candidatos dentro de la caja pueden ser el objetivo.
+    # Verde: se lo encontró en este cuadro · amarillo: no se lo encontró y la caja crece
+    # mientras se lo espera · naranjo: caja chica donde se busca su silueta.
+    for tipo, (px, py), radio in puertas:
+        if tipo == "silueta":
+            color_caja = (0, 140, 255)
+        else:
+            color_caja = (120, 220, 120) if objetivo else (0, 220, 255)
+        r = int(round(radio))
+        p0 = (int(round(px)) - r, int(round(py)) - r)
+        cv2.rectangle(frame, p0, (p0[0] + 2 * r, p0[1] + 2 * r), color_caja, g, cv2.LINE_AA)
+        if tipo == "color":
+            cv2.putText(frame, "puerta", (max(p0[0], 0) + 3 * g, max(p0[1], 0) + 12 * g), FUENTE,
+                        0.4 * g, color_caja, g, cv2.LINE_AA)
+
     if objetivo:
         x, y = int(round(objetivo["x"])), int(round(objetivo["y"]))
         largo = max(np.hypot(x - cx, y - cy), 1)
         cv2.arrowedLine(frame, (cx, cy), (x, y), (0, 220, 255), g, cv2.LINE_AA,
                         tipLength=min(0.3, 12 * g / largo))
+        # Magenta: visto por color · naranjo: seguido solo por su silueta
+        color = (0, 140, 255) if objetivo.get("por_silueta") else (255, 0, 255)
         if "radio" in objetivo:  # láser o figura circular: su círculo envolvente
             r = int(round(objetivo["radio"]))
-            cv2.circle(frame, (x, y), r, (255, 0, 255), 2 * g, cv2.LINE_AA)
+            cv2.circle(frame, (x, y), r, color, 2 * g, cv2.LINE_AA)
             x_min, x_max = x - r, x + r
         else:  # triángulo o cuadrado envolvente
             poli = np.round(objetivo["poligono"]).astype(np.int32)
-            cv2.polylines(frame, [poli], True, (255, 0, 255), 2 * g, cv2.LINE_AA)
+            cv2.polylines(frame, [poli], True, color, 2 * g, cv2.LINE_AA)
             if "punta" in objetivo:
                 px, py = (int(round(v)) for v in objetivo["punta"])
                 cv2.circle(frame, (px, py), 4 * g, (255, 255, 0), -1)  # punta del triángulo
             x_min, x_max = int(poli[:, 0].min()), int(poli[:, 0].max())
-        cv2.circle(frame, (x, y), 3 * g, (255, 0, 255), -1)
+        cv2.circle(frame, (x, y), 3 * g, color, -1)
 
         # El texto va a la derecha del objetivo, o a la izquierda si no cabe
-        texto = f"({error[0]:+.0f}, {error[1]:+.0f}) px"
+        texto = f"({error[0]:+.0f}, {error[1]:+.0f}) px" + ("  silueta" if objetivo.get("por_silueta") else "")
         tw = cv2.getTextSize(texto, FUENTE, 0.5 * g, g)[0][0] + 6 * g
         tx = x_max + 6 if x_max + 6 + tw < ancho else x_min - 6 - tw
         etiqueta(frame, texto, tx, y - 10 * g, 0.5 * g, g)
@@ -706,12 +828,12 @@ def bucle_video():
     while True:
         with hay_cuadro:
             hay_cuadro.wait_for(lambda: cuadro_video is not None)
-            frame, objetivo, error, fps, mascara, descartes = cuadro_video
+            frame, objetivo, error, fps, mascara, descartes, puertas = cuadro_video
             cuadro_video = None
 
         t_ini = time.perf_counter()
         frame = frame.copy()  # el original queda sin dibujar en ultimo_frame
-        dibujar(frame, objetivo, error, fps, mascara, descartes)
+        dibujar(frame, objetivo, error, fps, mascara, descartes, puertas)
         ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_CALIDAD])
         t_fin = time.perf_counter()
         if ok:
@@ -765,7 +887,11 @@ def bucle_camara():
             seguidor.reiniciar()
 
         candidatos, mascara, descartes = detectar(frame)
-        objetivo = seguidor.elegir(candidatos, t, ancho)
+        # La silueta sirve para el avión y la figura (el láser es más claro que su entorno, no más oscuro)
+        silueta = None
+        if SILUETA_ACTIVA and OBJETIVO != "laser":
+            silueta = lambda centro, radio: detectar_silueta(frame, centro, radio)
+        objetivo = seguidor.elegir(candidatos, t, ancho, silueta)
         error = calcular_error(objetivo["x"], objetivo["y"], ancho, alto, meta["fov"]) if objetivo else None
 
         # Búsqueda -> Seguimiento apenas aparece el objetivo (ya confirmado por el seguidor)
@@ -794,7 +920,7 @@ def bucle_camara():
         ultimo_frame = frame
         with hay_cuadro:
             cuadro_video = (frame, objetivo, error, fps, mascara if VER_MASCARA else None,
-                            descartes if VER_MASCARA else ())
+                            descartes if VER_MASCARA else (), list(seguidor.puertas))
             hay_cuadro.notify()
         proc_ms = (time.perf_counter() - t_ini) * 1000
 
@@ -802,6 +928,7 @@ def bucle_camara():
             **camara.info,
             "etapa": etapa_frame,
             "detectado": objetivo is not None,
+            "por_silueta": bool(objetivo and objetivo.get("por_silueta")),
             "x": round(objetivo["x"], 1) if objetivo else None,
             "y": round(objetivo["y"], 1) if objetivo else None,
             "objetivo": OBJETIVO,
@@ -952,7 +1079,9 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
     <section class="card">
       <h2>Video en tiempo real <span class="num" id="tag-res">—</span></h2>
       <img id="video" src="/video" alt="Video de la cámara con el objetivo detectado">
-      <p class="nota">Cruz = centro de la imagen · contorno magenta = objetivo · flecha = error de posición · celeste = píxeles que cuentan como del color del objetivo (con la máscara activada)</p>
+      <p class="nota">Cruz = centro de la imagen · contorno magenta = objetivo · naranjo = seguido solo por su silueta ·
+        caja «puerta» = zona alrededor de la posición anterior donde se acepta al objetivo
+        (verde: encontrado · amarillo: se lo espera y crece · naranja: búsqueda por silueta) · flecha = error de posición · celeste = píxeles que cuentan como del color del objetivo (con la máscara activada)</p>
     </section>
     <section class="card">
       <h2>Error de posición vs tiempo <span>últimos 10 s</span></h2>
@@ -1125,6 +1254,22 @@ fieldset:disabled button,fieldset:disabled input{cursor:not-allowed}
         </div>
         <p class="nota">Etiquetas sobre una mancha descartada: «cobertura» es la parte de la figura envolvente
           que cubre el color, bajo la mínima · en el cuadrado, «lados» es lado corto/lado largo, muy distinto de 1.</p>
+      </div>
+
+      <div class="grupo" data-objetivos="triangulo figura">
+        <h3>Seguimiento por silueta (contraluz)</h3>
+        <label class="casilla"><input type="checkbox" id="silueta-activa">
+          Si mientras se sigue al objetivo se deja de ver su color, seguirlo por su forma</label>
+        <div class="campos">
+          <label class="campo"><span>Contraste mínimo (SILUETA_CONTRASTE)</span>
+            <input type="number" id="silueta-contraste" min="5" max="255" step="1" required>
+            <small>cuánto más oscuro que su entorno se ve el objetivo (0 a 255)</small></label>
+          <label class="campo"><span>Tiempo máximo sin color (SILUETA_MAX_S) [s]</span>
+            <input type="number" id="silueta-max-s" min="0.1" max="10" step="0.1" required>
+            <small>después se da por perdido y se vuelve a buscar por color</small></label>
+        </div>
+        <p class="nota">Solo se busca cerca de la última posición del objetivo y con un tamaño parecido:
+          nunca sirve para encontrarlo por primera vez. En el video, el contorno se pinta naranjo.</p>
       </div>
 
       <div class="grupo">
@@ -1403,7 +1548,7 @@ function pintarEstado(d) {
   pintarEtapa(d.etapa);
   const det = d.detectado;
   $('estado').innerHTML = det
-    ? '<span class="ico ok">✓</span> Objetivo detectado'
+    ? '<span class="ico ok">✓</span> Objetivo detectado' + (d.por_silueta ? ' · solo forma' : '')
     : '<span class="ico no">✕</span> Sin objetivo';
 
   $('ex').textContent = det ? firmado(d.ex) + ' px' : '—';
@@ -1470,7 +1615,7 @@ async function actualizar() {
   } catch (e) {
     marcarConexion(false);
   }
-  setTimeout(actualizar, 100);
+  setTimeout(actualizar, 200);  // 5 Hz: cada consulta le quita tiempo a la detección
 }
 
 // ---------- Parámetros de detección ----------
@@ -1500,6 +1645,9 @@ function mostrarAjustes(a) {
   $('brillo-min').value = a.brillo_min;
   $('relleno-min').value = a.relleno_min;
   $('ocupacion-max').value = a.ocupacion_max;
+  $('silueta-activa').checked = a.silueta_activa;
+  $('silueta-contraste').value = a.silueta_contraste;
+  $('silueta-max-s').value = a.silueta_max_s;
   $('isosceles-tol').value = a.isosceles_tol;
   $('exposicion-ev').value = a.exposicion_ev;
   $('figura-color').value = a.figura_color;
@@ -1582,6 +1730,8 @@ $('form-ajustes').addEventListener('submit', e => {
                  tono_max: Number($('tono-max').value), sat_min: Number($('sat-min').value),
                  brillo_min: Number($('brillo-min').value), relleno_min: Number($('relleno-min').value),
                  ocupacion_max: Number($('ocupacion-max').value), isosceles_tol: Number($('isosceles-tol').value),
+                 silueta_activa: $('silueta-activa').checked, silueta_contraste: Number($('silueta-contraste').value),
+                 silueta_max_s: Number($('silueta-max-s').value),
                  exposicion_ev: Number($('exposicion-ev').value),
                  figura_tono_tol: Number($('figura-tono-tol').value), figura_sat_min: Number($('figura-sat-min').value),
                  figura_cobertura_min: Number($('figura-cobertura-min').value),
@@ -1617,11 +1767,20 @@ def index():
 @app.route("/datos")
 def datos():
     desde = request.args.get("desde", -1, type=int)
+    # Con el candado solo se copian las referencias: el bucle de la cámara también lo usa y
+    # no debe esperar mientras se arma el JSON (estado se reemplaza entero en cada cuadro,
+    # nunca se modifica, así que se puede leer fuera del candado)
     with lock:
-        if desde > id_frame:  # el servidor se reinició: enviar todo el historial
+        seq, actual = id_frame, estado
+        if desde > seq:  # el servidor se reinició: enviar todo el historial
             desde = -1
-        muestras = [m for m in historial if m[0] > desde]
-        return jsonify(seq=id_frame, actual=estado, muestras=muestras)
+        muestras = []
+        for m in reversed(historial):  # las nuevas están al final: no se recorre todo
+            if m[0] <= desde:
+                break
+            muestras.append(m)
+    muestras.reverse()
+    return jsonify(seq=seq, actual=actual, muestras=muestras)
 
 
 def generador_mjpeg():
@@ -1670,6 +1829,8 @@ AJUSTES_NUMERICOS = {
     "relleno_min": (0.3, 1, 3),
     "ocupacion_max": (0.3, 1, 3),
     "isosceles_tol": (0.01, 1, 3),
+    "silueta_contraste": (5, 255, 0),
+    "silueta_max_s": (0.1, 10, 2),
     "exposicion_ev": (-4, 4, 2),
     "figura_tono_tol": (1, 90, 0),
     "figura_sat_min": (0, 255, 0),
@@ -1691,6 +1852,7 @@ def ajustes_actuales():
             "tono_max": TONO_MAX, "sat_min": SAT_MIN, "brillo_min": BRILLO_MIN,
             "relleno_min": RELLENO_MIN, "exposicion_ev": EXPOSICION_EV, "ver_mascara": VER_MASCARA,
             "ocupacion_max": OCUPACION_MAX, "isosceles_tol": ISOSCELES_TOL,
+            "silueta_activa": SILUETA_ACTIVA, "silueta_contraste": SILUETA_CONTRASTE, "silueta_max_s": SILUETA_MAX_S,
             "figura_forma": FIGURA_FORMA, "figura_color": FIGURA_COLOR, "figura_tono_tol": FIGURA_TONO_TOL,
             "figura_sat_min": FIGURA_SAT_MIN, "figura_cobertura_min": FIGURA_COBERTURA_MIN,
             "figura_area_min": FIGURA_AREA_MIN,
@@ -1715,6 +1877,8 @@ def validar_ajustes(datos):
     if not (isinstance(a["figura_color"], str) and re.fullmatch(r"#[0-9a-fA-F]{6}", a["figura_color"])):
         raise ValueError('figura_color debe ser un color "#rrggbb"')
     a["figura_color"] = a["figura_color"].lower()
+    if not isinstance(a["silueta_activa"], bool):
+        raise ValueError("silueta_activa debe ser true o false")
     if not isinstance(a["ver_mascara"], bool):
         raise ValueError("ver_mascara debe ser true o false")
     for k, (minimo, maximo, decimales) in AJUSTES_NUMERICOS.items():
@@ -1732,7 +1896,7 @@ def aplicar_ajustes(datos, guardar):
     global OBJETIVO, AREA_MIN, PROPORCION_TOL, AREA_MIN_LASER, CIRCULARIDAD_MIN
     global OMEGA_MAX, KP_PAN, KI_PAN, KP_TILT, KI_TILT
     global TONO_MAX, SAT_MIN, BRILLO_MIN, RELLENO_MIN, EXPOSICION_EV, VER_MASCARA
-    global OCUPACION_MAX, ISOSCELES_TOL
+    global OCUPACION_MAX, ISOSCELES_TOL, SILUETA_ACTIVA, SILUETA_CONTRASTE, SILUETA_MAX_S
     global FIGURA_FORMA, FIGURA_COLOR, FIGURA_TONO_TOL, FIGURA_SAT_MIN, FIGURA_COBERTURA_MIN, FIGURA_AREA_MIN
     a = validar_ajustes(datos)
     FIGURA_FORMA, FIGURA_COLOR, FIGURA_TONO_TOL = a["figura_forma"], a["figura_color"], a["figura_tono_tol"]
@@ -1741,6 +1905,8 @@ def aplicar_ajustes(datos, guardar):
     TONO_MAX, SAT_MIN, BRILLO_MIN = a["tono_max"], a["sat_min"], a["brillo_min"]
     RELLENO_MIN, EXPOSICION_EV, VER_MASCARA = a["relleno_min"], a["exposicion_ev"], a["ver_mascara"]
     OCUPACION_MAX, ISOSCELES_TOL = a["ocupacion_max"], a["isosceles_tol"]
+    SILUETA_ACTIVA, SILUETA_CONTRASTE = a["silueta_activa"], a["silueta_contraste"]
+    SILUETA_MAX_S = a["silueta_max_s"]
     OBJETIVO, AREA_MIN, PROPORCION_TOL = a["objetivo"], a["area_min"], a["proporcion_tol"]
     AREA_MIN_LASER, CIRCULARIDAD_MIN = a["area_min_laser"], a["circularidad_min"]
     OMEGA_MAX, KP_PAN, KI_PAN, KP_TILT, KI_TILT = (a[k] for k in AJUSTES_CONTROL)
